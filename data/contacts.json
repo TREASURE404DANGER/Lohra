@@ -1,0 +1,10 @@
+{
+  "_help": "Add contacts as \"Name\": \"+countrycode number\" or \"Name\": { \"number\": \"+...\", \"aliases\": [\"nickname\"] }. Groups: { \"jid\": \"12036...@g.us\" }. Keys starting with _ are ignored. Or use: Lohra add contact 090... as Thomas alias Mr. T",
+  "Test Contact": {
+    "number": "+2348012345678",
+    "aliases": [
+      "myself",
+      "test"
+    ]
+  }
+}

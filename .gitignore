@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment variables & secrets
+.env
+
+# WhatsApp Auth credentials & session data
+data/auth/
+data/agent/state.json
+data/agent/audit.jsonl
+data/agent/control.sock
+data/health.json
+data/pairing-code.txt
+
+# Media caches
+data/statuses/media/
+data/tmp-audio/
+data/tmp/
+
+# Logs & OS artifacts
+*.log
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip
+*.tar.gz

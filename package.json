@@ -1,0 +1,19 @@
+{
+  "name": "wabot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "ffmpeg-static": "^5.3.0",
+    "lru-cache": "^11.1.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
