@@ -11,7 +11,9 @@ import { normalizeMessageContent } from 'baileys';
 import { atomicWrite, withTimeout } from '../src/util.js';
 import { extractText, digitsOf } from '../src/bot.js';
 import { runAgentCommand } from './_agentlive.js';
+import { parseRequest, cleanText as cleanJudgeText } from './_judge.js';
 import { TOOL_DECLS, SYSTEM_PROMPT, makeDispatch, commandReply, STATE_TOOLS } from './_agenttools.js';
+import { BULK, planRecipients, bulkPrompt, personalize, pickDelaySec, gapMs, humanDuration, estimateSec, finalNote, counts, toList } from './_bulk.js';
 import { loadContacts, resolveRecipient, display, mask, classifyEmoji, classifyWord, parseContactInput, saveContact, deleteContact } from './_contacts.js';
 
 const DEFAULTS = {
@@ -20,6 +22,7 @@ const DEFAULTS = {
   allowRawNumbers: true,      // false = agent may only message people in contacts.json
   defaultCountryCode: '',     // e.g. "234": lets "0801..." style numbers work
   verifyNumbers: true,        // check the number is on WhatsApp before asking you
+  bulkDelaySec: BULK.delaySec, bulkJitter: BULK.jitter, maxBulk: BULK.maxRecipients, maxBulkPerDay: BULK.maxPerDay, bulkFailStreak: BULK.failStreak, // broadcasts
 };
 const FINAL = new Set(['sent', 'drafted', 'declined', 'expired', 'cancelled', 'failed']);
 const ID_CHARS = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -28,8 +31,8 @@ const err = (error, message, extra = {}) => ({ ok: false, error, message, ...ext
 const human = (sec) => (sec < 120 ? `${sec}s` : `${Math.round(sec / 60)} min`);
 
 export class Agent {
-  constructor(api, { now = Date.now } = {}) {
-    this.api = api; this.log = api.log; this.now = now;
+  constructor(api, { now = Date.now, sleep = null } = {}) {
+    this.api = api; this.log = api.log; this.now = now; this.sleepFn = sleep; this.bulkRun = null;
     this.dir = path.join(api.config.dataDir, 'agent');
     this.contactsFile = path.join(api.config.dataDir, 'contacts.json');
     this.actions = new Map();
@@ -54,6 +57,8 @@ export class Agent {
 
   async stop() {
     clearInterval(this.timer);
+    const run = this.bulkRun;
+    if (run) { run.stop = true; run.reason = 'the bot was reloaded'; run.wake?.(); await Promise.race([run.done, new Promise((r) => setTimeout(r, 15_000))]).catch(() => {}); }
     await new Promise((r) => (this.server ? this.server.close(() => r()) : r()));
     this.server?.closeAllConnections?.();
     await this.#chain.catch(() => {});
@@ -71,7 +76,11 @@ export class Agent {
     }
     this.paused = !!s.paused;
     for (const a of Object.values(s.actions || {})) {
-      if (a.status === 'sending' || a.status === 'drafting') Object.assign(a, { status: 'failed', error: 'interrupted by a restart: check the chat before retrying' });
+      if (a.type === 'bulk' && a.status === 'sending') {
+        for (const r of a.recips) if (r.status === 'queued') r.status = 'skipped';
+        const c = counts(a);
+        Object.assign(a, { status: 'failed', interrupted: true, error: `interrupted by a restart: ${c.sent} sent, ${c.skipped + c.failed} NOT sent` });
+      } else if (a.status === 'sending' || a.status === 'drafting') Object.assign(a, { status: 'failed', error: 'interrupted by a restart: check the chat before retrying' });
       if (a.status === 'pending' && a.expiresAt <= this.now()) a.status = 'expired';
       this.actions.set(a.id, a);
       if (a.msgId) this.byMsg.set(a.msgId, a.id);
@@ -106,11 +115,20 @@ export class Agent {
 
   // ---------- control socket ----------
   async #listen() {
-    const sock = path.join(this.dir, 'control.sock');
-    await fs.rm(sock, { force: true });
+    const sock = process.platform === 'win32'
+      ? path.join('\\\\.\\pipe\\lohra-agent', crypto.randomBytes(4).toString('hex'))
+      : path.join(this.dir, 'control.sock');
+    
+    if (process.platform !== 'win32') await fs.rm(sock, { force: true }).catch(() => {});
+    
     this.server = net.createServer((c) => this.#onConn(c));
-    await new Promise((res, rej) => { this.server.once('error', rej); this.server.listen(sock, () => { this.server.off('error', rej); res(); }); });
-    await fs.chmod(sock, 0o600);
+    await new Promise((res, rej) => { 
+      this.server.once('error', (err) => {
+        if (process.platform === 'win32') { this.log.warn('Agent CLI socket skipped on Windows'); res(); } else rej(err);
+      });
+      this.server.listen(sock, () => { this.server.off('error', rej); res(); }); 
+    });
+    if (process.platform !== 'win32') await fs.chmod(sock, 0o600).catch(() => {});
   }
 
   #onConn(c) {
@@ -141,8 +159,15 @@ export class Agent {
         case 'contacts.add': return await this.addContact(req);
         case 'contacts.remove': return await this.removeContact(req.name);
         case 'status.get': return await this.#statusGet(req);
+        case 'msgs.find': return await this.#msgsFind(req);
+        case 'msgs.send': return await this.#msgsSend(req);
+        case 'watch.add': return await this.#watchAdd(req);
+        case 'watch.list': return this.#watchList();
+        case 'watch.cancel': return await this.#watchCancel(req);
         case 'send': return await this.#propose('send', req);
         case 'draft': return await this.#propose('draft', req);
+        case 'send.bulk': return await this.#proposeBulk(req);
+        case 'stop': return await this.stopBulk(req.id);
         case 'notify': return await this.#notify(req.text);
         case 'get': return this.#get(req.id);
         case 'list': return this.#list();
@@ -153,6 +178,78 @@ export class Agent {
       this.log.error({ err: e.message, op: req?.op }, 'agent request failed');
       return err('internal', e.message);
     }
+  }
+
+  // ---------- watching (ongoing monitoring of a contact's NEW statuses/messages) ----------
+  // Event-driven (see _watch.js): nothing is polled. Matches are delivered to the owner's own chat, never to the contact.
+  async #watchAdd(req) {
+    if (this.paused) return err('paused', 'The owner has paused agent actions.', { hint: 'Tell the owner; they can resume with "Lohra agent resume".' });
+    const w = this.api.watch;
+    if (!w) return err('watch_unavailable', 'The watch engine is not running right now.', { retryable: true });
+    const who = String(req.contact || '').trim();
+    if (!who) return err('invalid_contact', 'Say whose statuses or messages to watch.');
+    const kind = req.kind === 'message' ? 'message' : req.kind === 'status' ? 'status' : null;
+    if (!kind) return err('invalid_kind', 'kind must be "status" (status/story updates) or "message" (chat messages).');
+    let condition = cleanJudgeText(req.condition, 120).replace(/\s+/g, ' ').trim();
+    const keep = req.keep_watching === true || req.keep_watching === 'true';
+    const hours = Math.min(720, Math.max(1, Number(req.hours) || 168));
+    const anywhere = kind === 'message' && req.anywhere === true;
+
+    const { contacts, error } = await this.#contacts();
+    if (error) return err('contacts_unreadable', error);
+    const r = resolveRecipient(contacts, who, { allowRaw: this.cfg.allowRawNumbers, defaultCc: this.cfg.defaultCountryCode });
+    if (r.status !== 'ok') return this.#resolved(r, who);
+    const c = r.contact;
+    if (c.group || !c.number) return err('invalid_contact', 'Only individual contacts with a phone number can be watched, not groups.');
+    const name = c.name || `+${c.number}`;
+
+    let rubric = '';
+    if (condition) {
+      const key = (process.env.GEMINI_API_KEY || '').trim();
+      if (!key) return err('no_api_key', 'GEMINI_API_KEY is not set, so the check for that condition cannot be built.');
+      try {
+        const spec = await parseRequest(`Watch ${name} for their next ${kind}: ${condition}`, { key });
+        if (!spec.ok) return err('invalid_request', spec.problem || 'That is not something I can watch for.');
+        rubric = spec.rubric;
+        condition = spec.condition || condition;
+      } catch (e) { return err('rubric_failed', `Could not build the check (${e.message}).`, { retryable: true }); }
+    }
+
+    const instruction = String(req.request || `${name}: ${kind}${condition ? ` ${condition}` : ''}`).slice(0, 300);
+    let task;
+    try {
+      task = await w.add({ target: { name, number: c.number, jid: c.jid }, kind, condition, rubric, once: !keep, anywhere, ttlHours: hours, instruction });
+    } catch (e) {
+      if (e.existing) return { ok: true, status: 'already_watching', id: e.existing.id, note: 'An identical watch is already running; nothing was added.' };
+      return err('watch_failed', e.message);
+    }
+    if (req.source !== 'voice') await this.#notify(`👀 Watching ${name}'s next ${kind}${condition ? ` that ${condition}` : ''} (#${task.id}, ${keep ? 'keeps going after matches' : 'stops after the first match'}). Cancel: Lohra watch cancel ${task.id}`).catch(() => {});
+    return {
+      ok: true, status: 'watching', id: task.id, contact: name, kind, condition: condition || null, keep_watching: keep, expires_in_hours: hours,
+      how_it_works: 'Not a timer: the bot reacts the moment a new item arrives and posts matches (with the media) in the owner\'s own chat.',
+    };
+  }
+
+  #watchList() {
+    const w = this.api.watch;
+    if (!w) return err('watch_unavailable', 'The watch engine is not running right now.', { retryable: true });
+    const row = (t) => ({ id: t.id, contact: t.target.name, kind: t.kind, condition: t.condition || null, keep_watching: !t.once, state: t.state, hours_left: t.state === 'active' ? Math.round(((t.expiresAt - this.now()) / 3600e3) * 10) / 10 : null, seen: t.stats.seen, matches: t.stats.matches });
+    const ended = w.list().filter((t) => t.state !== 'active').sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0)).slice(0, 5);
+    return { ok: true, active: w.active().map(row), recently_ended: ended.map(row) };
+  }
+
+  async #watchCancel(req) {
+    const w = this.api.watch;
+    if (!w) return err('watch_unavailable', 'The watch engine is not running right now.', { retryable: true });
+    const which = String(req.id || req.contact || '').trim();
+    if (!which) return err('invalid_id', 'Give a watch id, a contact name, or "all".');
+    let hit = await w.cancel(which);
+    if (!hit.length) {
+      const q = which.toLowerCase().replace(/^watching\s+/, '');
+      for (const t of w.active().filter((x) => q && x.target.name.toLowerCase().includes(q))) hit.push(...(await w.cancel(t.id)));
+    }
+    if (!hit.length) return err('not_found', `No active watch matches "${which}".`, { hint: 'Call list_watches to see the ids.' });
+    return { ok: true, status: 'cancelled', cancelled: hit.map((t) => ({ id: t.id, contact: t.target.name })) };
   }
 
   // ---------- helpers ----------
@@ -167,6 +264,53 @@ export class Agent {
     return await statusStore.deliverLatest(contact, contacts, self);
   }
 
+  // ---------- looking back at saved chats (see _archive.js) ----------
+  // Read-only search, plus delivery of a saved message into the OWNER's own chat. Nothing here ever goes to the contact.
+  async #msgsFind(req) {
+    const archive = this.api.archive;
+    if (!archive) return err('archive_unavailable', 'The chat archive is not running right now.', { retryable: true });
+    const who = String(req.contact || '').trim();
+    if (!who) return err('invalid_contact', 'Say whose chat to look in.');
+    const kind = String(req.kind || 'any').toLowerCase();
+    if (!['any', 'text', 'voice', 'image', 'video', 'document', 'sticker'].includes(kind)) return err('invalid_kind', 'kind must be any, text, voice, image, video, document or sticker.');
+    const from = String(req.from || 'any').toLowerCase();
+    if (!['any', 'them', 'me'].includes(from)) return err('invalid_from', 'from must be any, them or me.');
+    const { contacts, error } = await this.#contacts();
+    if (error) return err('contacts_unreadable', error);
+    const r = resolveRecipient(contacts, who, { allowRaw: this.cfg.allowRawNumbers, defaultCc: this.cfg.defaultCountryCode });
+    if (r.status !== 'ok') return this.#resolved(r, who);
+    const c = r.contact;
+    const name = c.name || (c.number ? `+${c.number}` : 'that chat');
+    const rows = await archive.find({ number: c.number, jid: c.group ? c.jid : undefined, kind, from, query: cleanJudgeText(req.query, 120), limit: Number(req.limit) || 5, sinceHours: Number(req.hours) || 0 });
+    const st = archive.stats();
+    if (!rows.length) {
+      return err('none_found', `No saved ${kind === 'any' ? '' : `${kind} `}messages with ${name}${req.query ? ` matching "${req.query}"` : ''}.`, {
+        archive_since: st.since ? new Date(st.since).toISOString() : null,
+        hint: `Only messages the bot saw while connected are kept (for ${st.retention_days} days${st.enabled ? '' : '; the archive is switched OFF'}); it cannot read older chats. Say so plainly. For FUTURE messages offer watch_contact.`,
+      });
+    }
+    const out = { ok: true, contact: name, count: rows.length, messages: rows };
+    if (req.deliver_newest === true || req.deliver_newest === 'true') out.delivered = await this.#msgsSend({ id: rows[0].id, who: name, source: req.source });
+    return out;
+  }
+
+  async #msgsSend(req) {
+    if (this.paused) return err('paused', 'The owner has paused agent actions.', { hint: 'Tell the owner; they can resume with "Lohra agent resume".' });
+    const archive = this.api.archive;
+    if (!archive) return err('archive_unavailable', 'The chat archive is not running right now.', { retryable: true });
+    const self = this.#self();
+    if (!self) return err('bot_offline', 'The WhatsApp bot is not connected right now.', { retryable: true });
+    const rec = archive.get(req.id);
+    if (!rec) return err('not_found', 'No saved message has that id.', { hint: 'Call find_messages first and use an id from its result.' });
+    const now = this.now();
+    this.deliveries = (this.deliveries || []).filter((t) => now - t < 3600_000);
+    if (this.deliveries.length >= 15) return err('rate_limited', 'Too many messages forwarded to the owner this hour (15).', { hint: 'Tell the owner and try later.' });
+    this.deliveries.push(now);
+    const res = await archive.deliver(rec, self, { send: this.api.send, who: req.who || '' });
+    await this.#audit('msg_delivered', null, { msg: rec.id, kind: rec.kind, ok: res.ok, error: res.error, source: req.source || 'wabctl' });
+    return res.ok ? { ok: true, status: 'delivered_to_owner', kind: res.kind, note: 'It is in the owner\'s own chat now. Nothing was sent to the contact.' } : res;
+  }
+
   #self() {
     const { conn } = this.api;
     const d = digitsOf(conn.sock?.user?.id);
@@ -179,6 +323,7 @@ export class Agent {
       id: a.id, type: a.type, status: a.status, to: a.to.name ?? a.to.display, recipient_hint: a.to.hint, text: a.text,
       created_at: new Date(a.createdAt).toISOString(), expires_at: a.type === 'send' ? new Date(a.expiresAt).toISOString() : undefined,
       decided_via: a.via, error: a.error,
+      ...(a.type === 'bulk' ? { recipients: a.recips.length, ...counts(a), delay_sec: a.delaySec, skipped_people: a.skipped } : {}),
     };
   }
   #newId() { let id; do { id = Array.from({ length: 4 }, () => ID_CHARS[crypto.randomInt(ID_CHARS.length)]).join(''); } while (this.actions.has(id)); return id; }
@@ -284,6 +429,146 @@ export class Agent {
     return { ok: true, ...this.#view(a), message: 'Waiting for the owner to approve on WhatsApp (nothing has been sent yet). Tell them to check their phone, then use wait_for_action / check_action.' };
   }
 
+
+  // ---------- broadcasts: one message, several people, paced ----------
+  async #proposeBulk(req) {
+    if (this.paused) return err('paused', 'The owner has paused agent actions.', { hint: 'Tell the owner; they can resume with "Lohra agent resume".' });
+    const text = typeof req.text === 'string' ? req.text.replace(/\r\n/g, '\n').trim() : '';
+    if (!text) return err('invalid_text', 'The message text is empty.');
+    if (text.length > this.cfg.maxText) return err('invalid_text', `The message is too long (max ${this.cfg.maxText} characters).`);
+    if (CTRL.test(text)) return err('invalid_text', 'The message contains control characters.');
+    if (!toList(req.to).length && !(req.all === true || req.all === 'true')) return err('no_recipients', 'Say who gets it: a list of names, or all contacts.');
+    if (this.bulkRun || this.#pending().some((x) => x.type === 'bulk')) return err('bulk_busy', 'A broadcast is already waiting for approval or still sending.', { hint: 'Let the owner finish or stop that one first.' });
+
+    const { contacts, error } = await this.#contacts();
+    if (error) return err('contacts_unreadable', error);
+    const self = this.#self();
+    if (!self) return err('bot_offline', 'The WhatsApp bot is not connected right now.', { retryable: true });
+    const plan = planRecipients(contacts, req, { selfDigits: digitsOf(self), allowRaw: this.cfg.allowRawNumbers, defaultCc: this.cfg.defaultCountryCode });
+    if (!plan.ok) return this.#resolved(plan.bad.result, plan.bad.query);
+    let { recips } = plan;
+    const skipped = [...plan.skipped];
+
+    // the same text already sent to someone in the last 24 h is not sent again
+    const dayAgo = this.now() - 86400_000;
+    const sentBefore = new Set();
+    let sentToday = 0;
+    for (const x of this.actions.values()) {
+      if (x.type !== 'bulk') continue;
+      for (const r of x.recips) if (r.status === 'sent' && (r.at || x.createdAt) > dayAgo) { sentToday++; if (x.text.trim() === text) sentBefore.add(r.jid); }
+    }
+    recips = recips.filter((c) => { if (sentBefore.has(c.jid)) { skipped.push({ name: c.name || display(c), reason: 'already got this message today' }); return false; } return true; });
+    if (!recips.length) return err('no_recipients', 'Nobody left to send to.', { skipped });
+    if (recips.length > this.cfg.maxBulk) return err('too_many_recipients', `${recips.length} people is over the limit of ${this.cfg.maxBulk} per broadcast.`, { hint: 'Split it into smaller groups, or the owner can raise maxBulk in data/agent/config.json.' });
+    if (sentToday + recips.length > this.cfg.maxBulkPerDay) return err('daily_limit', `That would make ${sentToday + recips.length} broadcast messages in 24 hours (limit ${this.cfg.maxBulkPerDay}). Sending in bulk can get a WhatsApp number restricted.`, { hint: 'Tell the owner and try again later.' });
+
+    const hourAgo = this.now() - 3600_000;
+    this.stamps = this.stamps.filter((t) => t > hourAgo);
+    if (this.stamps.length >= this.cfg.maxPerHour) return err('rate_limited', 'Too many requests in the last hour.', { retryable: true });
+    this.stamps.push(this.now());
+
+    // one batched "is this number on WhatsApp" check; numbers missing from the answer stay in (unverified)
+    let verified = null;
+    const people = recips.filter((c) => !c.group);
+    if (this.cfg.verifyNumbers && people.length) {
+      try {
+        const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+        const hits = (await withTimeout(sock.onWhatsApp(...people.map((c) => c.jid)), 20_000, 'number check')) || [];
+        const gone = new Set(hits.filter((h) => h.exists === false).map((h) => digitsOf(h.jid)));
+        recips = recips.filter((c) => { if (!c.group && gone.has(c.number)) { skipped.push({ name: c.name || display(c), reason: 'not on WhatsApp' }); return false; } return true; });
+        verified = true;
+      } catch { verified = false; }
+      if (!recips.length) return err('no_recipients', 'None of those numbers are on WhatsApp.', { skipped });
+    }
+
+    const delaySec = pickDelaySec(req.delay_sec, { def: this.cfg.bulkDelaySec });
+    const n = recips.length;
+    const label = `${n} ${n === 1 ? 'person' : 'people'}`;
+    const ttl = this.cfg.ttlSec;
+    const a = {
+      id: this.#newId(), type: 'bulk', status: 'pending', query: label, verified, text, delaySec, skipped,
+      recips: recips.map((c) => ({ jid: c.jid, number: c.number, name: c.name, group: !!c.group, status: 'queued' })),
+      to: { name: label, number: null, jid: self, group: false, display: label, hint: '' },
+      selfJid: self, createdAt: this.now(), expiresAt: this.now() + ttl * 1000, source: String(req.source || '').slice(0, 40),
+    };
+    this.actions.set(a.id, a);
+    await this.#audit('proposed', a, { text, recipients: n, names: a.recips.map((r) => r.name || r.number), delaySec, skipped: skipped.length, source: a.source });
+    try {
+      a.prompt = bulkPrompt(a, ttl);
+      const res = await this.api.send(self, { text: a.prompt });
+      a.msgId = res?.key?.id;
+      if (!a.msgId) throw new Error('no message id returned');
+      this.byMsg.set(a.msgId, a.id);
+    } catch (e) {
+      this.actions.delete(a.id);
+      await this.#audit('failed', a, { error: e.message });
+      return err('send_failed', `Could not reach the owner's WhatsApp: ${e.message}`, { retryable: true });
+    }
+    await this.#save();
+    this.log.info({ id: a.id, recipients: n }, 'agent: broadcast approval requested');
+    return { ok: true, ...this.#view(a), message: `Waiting for the owner to approve on WhatsApp (nothing has been sent yet). It goes to ${label}, one at a time. Tell them to check their phone.` };
+  }
+
+  #startBulk(a) {
+    a.status = 'sending'; a.startedAt = this.now();
+    const run = { id: a.id, stop: false, reason: '', wake: null, done: null };
+    this.bulkRun = run;
+    run.done = this.#runBulk(a, run)
+      .catch((e) => this.log.error({ err: e.message, id: a.id }, 'broadcast crashed'))
+      .finally(() => { if (this.bulkRun === run) this.bulkRun = null; });
+  }
+
+  #pace(ms, run) {
+    if (this.sleepFn) return this.sleepFn(ms);
+    return new Promise((res) => { const t = setTimeout(res, ms); run.wake = () => { clearTimeout(t); res(); }; });
+  }
+
+  async #runBulk(a, run) {
+    const total = a.recips.length;
+    await this.#save();
+    await this.#note(a, `*Sending to ${total} ${total === 1 ? 'person' : 'people'}*\\nOne every ${a.delaySec}s (about ${humanDuration(estimateSec(total, a.delaySec))}).\\n_Stop any time:_ *Lohra --agent stop*`);
+    let streak = 0;
+    let why = '';
+    for (let i = 0; i < total; i++) {
+      const r = a.recips[i];
+      if (r.status !== 'queued') continue;
+      if (run.stop || this.paused) { why = run.reason || (this.paused ? 'agent paused' : 'stopped'); break; }
+      try {
+        const res = await this.api.send(r.jid, { text: personalize(a.text, r) });
+        r.status = 'sent'; r.sentId = res?.key?.id; r.at = this.now(); streak = 0;
+      } catch (e) {
+        r.status = 'failed'; r.error = String(e.message || e).slice(0, 100); streak++;
+        if (streak >= this.cfg.bulkFailStreak) { why = `${streak} failures in a row, last: ${r.error}`; await this.#save(); break; }
+      }
+      await this.#save();
+      const sent = counts(a).sent;
+      if (total > 25 && r.status === 'sent' && sent % 20 === 0 && i < total - 1) await this.#note(a, `_${sent} of ${total} sent..._`);
+      if (a.recips.slice(i + 1).some((x) => x.status === 'queued')) await this.#pace(gapMs(a.delaySec, this.cfg.bulkJitter), run);
+    }
+    for (const r of a.recips) if (r.status === 'queued') r.status = 'skipped';
+    const c = counts(a);
+    a.decidedAt = this.now();
+    if (why) { a.status = c.sent ? 'cancelled' : 'failed'; a.error = why; } else a.status = c.sent ? 'sent' : 'failed';
+    if (!why && !c.sent) a.error = 'every message failed';
+    await this.#save();
+    await this.#audit('bulk_done', a, { sent: c.sent, failed: c.failed, notSent: c.skipped, why });
+    await this.#note(a, finalNote(a, why));
+    this.log.info({ id: a.id, sent: c.sent, failed: c.failed, why }, 'agent: broadcast finished');
+  }
+
+  /** "Lohra agent stop": ends the running broadcast after the message in flight. Nobody after that gets it. */
+  async stopBulk(id) {
+    const run = this.bulkRun;
+    const want = String(id || '').toLowerCase();
+    if (!run || (want && want !== run.id)) {
+      const waiting = this.#pending().find((x) => x.type === 'bulk' && (!want || x.id === want));
+      if (waiting) return await this.cancel(waiting.id, 'owner');
+      return err('not_running', 'No broadcast is sending right now.');
+    }
+    run.stop = true; run.reason = 'stopped by owner'; run.wake?.();
+    return { ok: true, ...this.#view(this.actions.get(run.id)), message: 'Stopping after the message that is going out now. Nobody else will get it.' };
+  }
+
   #prompt(a, ttl) {
     const who = a.to.name ? `*${a.to.name}* (${a.to.display})` : `*${a.to.display}*`;
     const how = a.matchedBy === 'fuzzy' || a.matchedBy === 'partial' ? ` · matched from “${a.query}”` : '';
@@ -300,11 +585,16 @@ export class Agent {
   }
 
   async #deliverDraft(a) {
+    if (a.type === 'bulk') {
+      await this.api.send(a.selfJid, { text: `*Draft for ${a.recips.length} people*\\n_Copy or forward the message below:_` });
+      await this.api.send(a.selfJid, { text: a.text });
+      return;
+    }
     const who = a.to.name ? `*${a.to.name}* (${a.to.display})` : `*${a.to.display}*`;
     const link = !a.to.group && a.to.number ? `https://wa.me/${a.to.number}?text=${encodeURIComponent(a.text)}` : null;
     const head = link && link.length <= 1800
-      ? `✍️ *Draft for* ${who}\nTap to open their chat with this text filled in, or copy the message below:\n${link}`
-      : `✍️ *Draft for* ${who}\nCopy or forward the message below:`;
+      ? `*Draft for* ${who}\n_Tap to open their chat with this text filled in, or copy the message below:_\n${link}`
+      : `*Draft for* ${who}\n_Copy or forward the message below:_`;
     await this.api.send(a.selfJid, { text: head });
     await this.api.send(a.selfJid, { text: a.text });
   }
@@ -319,7 +609,7 @@ export class Agent {
     this.stamps = this.stamps.filter((x) => x > hourAgo);
     if (this.stamps.length >= this.cfg.maxPerHour) return err('rate_limited', 'Too many requests in the last hour.', { retryable: true });
     this.stamps.push(this.now());
-    await this.api.send(self, { text: `🤖 ${t}` });
+    await this.api.send(self, { text: t });
     await this.#audit('notify', null, { chars: t.length });
     return { ok: true, message: 'Note delivered to the owner\'s chat.' };
   }
@@ -331,17 +621,18 @@ export class Agent {
 
   #list() {
     const all = [...this.actions.values()].sort((a, b) => b.createdAt - a.createdAt);
-    return { ok: true, pending: all.filter((a) => a.status === 'pending').map((a) => this.#view(a)), recent: all.filter((a) => a.status !== 'pending').slice(0, 10).map((a) => this.#view(a)) };
+    return { ok: true, sending: all.filter((a) => a.status === 'sending').map((a) => this.#view(a)), pending: all.filter((a) => a.status === 'pending').map((a) => this.#view(a)), recent: all.filter((a) => a.status !== 'pending' && a.status !== 'sending').slice(0, 10).map((a) => this.#view(a)) };
   }
 
   async cancel(id, via = 'agent') {
     const a = this.actions.get(String(id || '').toLowerCase());
     if (!a) return err('not_found', `No action with id "${id}".`);
+    if (a.type === 'bulk' && a.status === 'sending') return await this.stopBulk(a.id);
     if (a.status !== 'pending') return err('not_pending', `That action is already ${a.status}.`, { status: a.status });
     a.status = 'cancelled'; a.decidedAt = this.now(); a.via = via;
     await this.#save();
     await this.#audit('cancelled', a, { via });
-    await this.#note(a, `🚫 Cancelled (#${a.id}). Nothing was sent.`);
+    await this.#note(a, `_Cancelled (#${a.id}). Nothing was sent._`);
     return { ok: true, ...this.#view(a) };
   }
 
@@ -356,24 +647,28 @@ export class Agent {
     if (decision === 'decline') {
       a.status = 'declined';
       await this.#save(); await this.#audit('declined', a, { via });
-      await this.#note(a, '❌ Declined. Nothing was sent.');
+      await this.#note(a, '_Declined. Nothing was sent._');
     } else if (decision === 'draft') {
       a.status = 'drafting';
       try {
         await this.#deliverDraft(a);
         a.status = 'drafted';
-      } catch (e) { a.status = 'failed'; a.error = e.message; await this.#note(a, `⚠️ Could not drop the draft: ${e.message}`); }
+      } catch (e) { a.status = 'failed'; a.error = e.message; await this.#note(a, `_Could not drop the draft:_ ${e.message}`); }
       await this.#save(); await this.#audit(a.status, a, { via, error: a.error });
+    } else if (a.type === 'bulk') {
+      if (this.bulkRun) return err('bulk_busy', 'Another broadcast is still sending.');
+      this.#startBulk(a);
+      await this.#audit('bulk_approved', a, { via, recipients: a.recips.length });
     } else {
       a.status = 'sending';
       await this.#save();
       try {
         const res = await this.api.send(a.to.jid, { text: a.text });
         a.status = 'sent'; a.sentId = res?.key?.id;
-        await this.#note(a, `✅ Sent to ${name}.`);
+        await this.#note(a, `*Sent to ${name}.*`);
       } catch (e) {
         a.status = 'failed'; a.error = e.message;
-        await this.#note(a, `⚠️ Not sent to ${name}: ${e.message}`);
+        await this.#note(a, `_Not sent to ${name}:_ ${e.message}`);
       }
       await this.#save(); await this.#audit(a.status, a, { via, error: a.error });
     }
@@ -384,15 +679,25 @@ export class Agent {
   async #expire(a) {
     a.status = 'expired'; a.decidedAt = this.now();
     await this.#save(); await this.#audit('expired', a);
-    await this.#note(a, `⌛ Expired (#${a.id}). Nothing was sent.`);
+    await this.#note(a, `_Expired (#${a.id}). Nothing was sent._`);
   }
 
-  async sweep() { for (const a of this.#pending()) if (a.expiresAt <= this.now()) await this.#expire(a); this.#prune(); }
+  async sweep() {
+    for (const a of this.#pending()) if (a.expiresAt <= this.now()) await this.#expire(a);
+    for (const a of this.actions.values()) {
+      if (a.type === 'bulk' && a.interrupted && !a.notified && this.#self()) {
+        a.notified = true; await this.#save();
+        await this.#note(a, finalNote(a, 'the bot restarted')).catch(() => {});
+      }
+    }
+    this.#prune();
+  }
 
   async setPaused(on, via = 'owner') {
     this.paused = on;
     let n = 0;
     if (on) for (const a of this.#pending()) { await this.cancel(a.id, via); n++; }
+    if (on && this.bulkRun) { this.bulkRun.stop = true; this.bulkRun.reason = 'agent paused'; this.bulkRun.wake?.(); }
     await this.#save(); await this.#audit(on ? 'paused' : 'resumed', null, { via, cancelled: n });
     return n;
   }
@@ -462,7 +767,9 @@ export class Agent {
 
   summary() {
     const p = this.#pending();
-    return [`Agent channel: ${this.paused ? 'PAUSED' : 'active'}`, p.length ? p.map((a) => `#${a.id} to ${a.to.name ?? a.to.display}: "${a.text.slice(0, 40)}${a.text.length > 40 ? '…' : ''}"`).join('\n') : 'Nothing waiting for you.'].join('\n');
+    const run = this.bulkRun && this.actions.get(this.bulkRun.id);
+    const live = run ? `*Sending #${run.id}:* ${counts(run).sent}/${run.recips.length} done. _Stop:_ *Lohra --agent stop*\\n` : '';
+    return [live + `Agent channel: ${this.paused ? 'PAUSED' : 'active'}`, p.length ? p.map((a) => `#${a.id} to ${a.to.name ?? a.to.display}: "${a.text.slice(0, 40)}${a.text.length > 40 ? '…' : ''}"`).join('\n') : 'Nothing waiting for you.'].join('\n');
   }
   pendingIds() { return this.#pending().map((a) => a.id); }
 }
@@ -479,7 +786,7 @@ export default {
   on: { 'messages.upsert': (data) => current?.onUpsert(data) },
   commands: {
     agent: {
-      description: 'Agent requests: status | yes|draft|no [id] | pause | resume',
+      description: 'Agent requests: status | yes|draft|no [id] | stop | pause | resume',
       ownerOnly: true,
       run: async (ctx) => {
         const ag = current;
@@ -490,38 +797,17 @@ export default {
           const n = await ag.setPaused(sub === 'pause', 'owner-command');
           return void (await ctx.reply(sub === 'pause' ? `Agent paused. ${n} waiting request(s) cancelled.` : 'Agent resumed.'));
         }
+        if (sub === 'stop') {
+          const r = await ag.stopBulk(ctx.args[1]);
+          return void (await ctx.reply(r.ok ? 'Stopped. ' + r.message : r.message));
+        }
         const d = { yes: 'approve', approve: 'approve', send: 'approve', draft: 'draft', no: 'decline', decline: 'decline' }[sub];
-        if (!d) return void (await ctx.reply('Use: agent status | yes [id] | draft [id] | no [id] | pause | resume'));
+        if (!d) return void (await ctx.reply('Use: agent status | yes [id] | draft [id] | no [id] | stop | pause | resume'));
         const ids = ag.pendingIds();
         const id = (ctx.args[1] || (ids.length === 1 ? ids[0] : '')).toLowerCase();
         if (!id) return void (await ctx.reply(ids.length ? `Which one? ${ids.map((i) => `#${i}`).join(' ')}` : 'Nothing is waiting.'));
         const r = await ag.decide(id, d, 'command');
         if (!r.ok) await ctx.reply(r.message);
-      },
-    },
-    command: {
-      aliases: ['cmd', 'do'],
-      description: 'Run a natural language command: Lohra command <text>',
-      ownerOnly: true,
-      run: async (ctx) => {
-        const ag = current;
-        if (!ag) return void (await ctx.reply('Agent channel is not running.'));
-        if (ag.isPaused()) return void (await ctx.reply('Agent actions are paused. Use "Lohra agent resume" to re-enable them.'));
-        const text = (ctx.argText || '').trim();
-        if (!text) return void (await ctx.reply('Usage: Lohra command <instruction>\nExample: Lohra command tell Thomas I will be 15 minutes late'));
-        const key = (process.env.GEMINI_API_KEY || '').trim();
-        if (!key) return void (await ctx.reply('Gemini API key is not configured. Set GEMINI_API_KEY in .env.'));
-        await ctx.react('⏳');
-        try {
-          const r = await ag.runCommand(text, { key });
-          await ctx.react('');
-          await ctx.reply(`🤖 ${commandReply(r.text, r.trace)}`);
-        } catch (err) {
-          await ctx.react('');
-          ag.log.warn({ err: err.message, code: err.code }, 'agent text command failed');
-          const ran = (err.trace || []).some((x) => STATE_TOOLS.has(x.tool));
-          await ctx.reply(`🤖 I could not finish that command (${err.message || 'error'}). ${ran ? 'Some steps may already have run: check "Lohra agent status".' : 'Nothing was done.'}`);
-        }
       },
     },
     contact: {
@@ -551,7 +837,7 @@ export default {
           const name = mRemove[1].trim();
           const r = await ag.removeContact(name);
           if (!r.ok) return void (await ctx.reply(r.message || `No contact named "${name}".`));
-          return void (await ctx.reply(`🗑️ Removed contact "${r.removed}".`));
+          return void (await ctx.reply(`Removed contact "${r.removed}".`));
         }
 
         // 3. Find contact: "Lohra contact find <name>" or "Lohra contact search <name>"
@@ -561,7 +847,7 @@ export default {
           const r = await ag.findContact(q);
           if (!r.ok || !r.match) return void (await ctx.reply(r.message || `No contact matching "${q}".`));
           const m = r.match;
-          return void (await ctx.reply(`🔍 Found: *${m.name}* (${m.hint || m.number || 'matched'})`));
+          return void (await ctx.reply(`Found: *${m.name}* (${m.hint || m.number || 'matched'})`));
         }
 
         // 4. Add or update contact:
@@ -578,10 +864,10 @@ export default {
         }
 
         const r = await ag.addContact(parsed);
-        if (!r.ok) return void (await ctx.reply(`❌ Could not save contact: ${r.error || r.message}`));
+        if (!r.ok) return void (await ctx.reply(`Could not save contact: ${r.error || r.message}`));
         const alText = r.aliases?.length ? ` (alias: ${r.aliases.map((a) => `"${a}"`).join(', ')})` : '';
         const noteText = r.note ? ` [Note: ${r.note}]` : '';
-        await ctx.reply(`✅ ${r.updated ? 'Updated' : 'Saved'} contact *${r.name}*: ${r.display}${alText}${noteText}`);
+        await ctx.reply(`${r.updated ? 'Updated' : 'Saved'} contact *${r.name}*: ${r.display}${alText}${noteText}`);
       },
     },
   },

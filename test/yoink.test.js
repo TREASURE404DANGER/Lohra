@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const file = fileURLToPath(new URL('../plugins/yoink.js', import.meta.url));
 const skip = !fs.existsSync(file) && 'plugins/yoink.js not present';
-const y = skip ? {} : await import(file);
+const y = skip ? {} : await import(pathToFileURL(file).href);
 
 test('extractUrls trims punctuation, dedupes, caps at 3', { skip }, () => {
   assert.deepEqual(y.extractUrls('see (https://a.com/x?y=1). and https://a.com/x?y=1, <https://b.com/z>!'), ['https://a.com/x?y=1', 'https://b.com/z']);

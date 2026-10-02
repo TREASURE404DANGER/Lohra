@@ -197,7 +197,7 @@ export class StatusStore {
       return {
         ok: false,
         error: 'no_status',
-        message: `No recent status updates found for "${query}". Note: WhatsApp statuses are captured live as contacts post them while Lohra is connected.`,
+        message: `No recent status updates found for "${query}". Note: WhatsApp statuses are captured live as contacts post them while Lohra is connected. This was a one-time look. If the owner asked to be told about FUTURE or REPEATED posts (keep an eye on, whenever, let me know when), you used the wrong tool: call watch_contact now with the same contact.`,
       };
     }
 
@@ -212,7 +212,7 @@ export class StatusStore {
     if (latest.type === 'image' || latest.type === 'video') {
       const buf = await this.getMediaBuffer(latest);
       if (buf) {
-        const cap = `📱 *Status from ${contactName}*\nPosted: ${dateStr} (${timeAgo})${latest.caption ? `\n\n"${latest.caption}"` : ''}`;
+        const cap = `*Status from ${contactName}*\nPosted: ${dateStr} (${timeAgo})${latest.caption ? `\n\n"${latest.caption}"` : ''}`;
         await this.send(selfJid, latest.type === 'video' ? { video: buf, caption: cap } : { image: buf, caption: cap });
         sent = true;
         detail = `${latest.type} sent with caption`;
@@ -221,12 +221,12 @@ export class StatusStore {
       const buf = await this.getMediaBuffer(latest);
       if (buf) {
         await this.send(selfJid, { audio: buf, mimetype: 'audio/mp4', ptt: true });
-        await this.send(selfJid, { text: `📱 *Voice Status from ${contactName}* (Posted: ${dateStr}, ${timeAgo})` });
+        await this.send(selfJid, { text: `*Voice Status from ${contactName}* (Posted: ${dateStr}, ${timeAgo})` });
         sent = true;
         detail = 'voice status sent';
       }
     } else if (latest.type === 'text') {
-      const text = `📱 *Status from ${contactName}* (Posted: ${dateStr}, ${timeAgo}):\n\n"${latest.text}"`;
+      const text = `*Status from ${contactName}* (Posted: ${dateStr}, ${timeAgo}):\n\n"${latest.text}"`;
       await this.send(selfJid, { text });
       sent = true;
       detail = 'text status sent';
@@ -235,7 +235,7 @@ export class StatusStore {
     if (!sent) {
       // Fallback if media download failed
       await this.send(selfJid, {
-        text: `📱 *Status from ${contactName}* (Posted: ${dateStr}, ${timeAgo})\nType: ${latest.type}\nText: ${latest.text || '(media expired)'}`,
+        text: `*Status from ${contactName}* (Posted: ${dateStr}, ${timeAgo})\nType: ${latest.type}\nText: ${latest.text || '(media expired)'}`,
       });
       detail = 'metadata summary sent';
     }

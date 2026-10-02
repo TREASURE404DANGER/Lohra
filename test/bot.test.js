@@ -7,19 +7,25 @@ import { loadConfig } from '../src/config.js';
 import { createStore } from '../src/store.js';
 import { Sender } from '../src/send.js';
 import { PluginManager } from '../src/plugins.js';
-import { Bot, parseCommand, extractText, digitsOf } from '../src/bot.js';
+import { Bot, parseCommand, parseNatural, extractText, digitsOf } from '../src/bot.js';
 import { fakeConn, silent, until, sleep } from './helpers.js';
 
-test('parseCommand', () => {
-  assert.deepEqual(parseCommand('.Ping a  b', '.'), { name: 'ping', args: ['a', 'b'], argText: 'a  b' });
+test('parseCommand and parseNatural', () => {
+  assert.deepEqual(parseCommand('.--Ping a  b', '.'), { name: 'ping', args: ['a', 'b'], argText: 'a  b' });
+  assert.equal(parseCommand('.Ping a  b', '.'), null);
   assert.equal(parseCommand('hello', '.'), null);
   assert.equal(parseCommand('. ', '.'), null);
   assert.equal(parseCommand('...', '.'), null);
-  const p = parseCommand('LOHRA   PiNg  x', 'Lohra');
+  const p = parseCommand('LOHRA   --PiNg  x', 'Lohra');
   assert.deepEqual(p, { name: 'ping', args: ['x'], argText: 'x' });
+  assert.equal(parseCommand('LOHRA   PiNg  x', 'Lohra'), null);
   assert.equal(parseCommand('lohraping', 'Lohra'), null);
   assert.equal(parseCommand('lohra', 'Lohra'), null);
   assert.equal(parseCommand('hello lohra ping', 'Lohra'), null);
+
+  assert.equal(parseNatural('Lohra remind David to call me', 'Lohra'), 'remind David to call me');
+  assert.equal(parseNatural('Lohra --ping', 'Lohra'), null);
+  assert.equal(parseNatural('Lohra', 'Lohra'), null);
 });
 test('extractText / digitsOf', () => {
   assert.equal(extractText({ extendedTextMessage: { text: 'x' } }), 'x');
@@ -55,30 +61,30 @@ const up = (conn, ...messages) => conn.emit('messages.upsert', { type: 'notify',
 
 test('owner (fromMe) command gets a reply', async () => {
   const { conn } = await setup();
-  up(conn, msg('.ping', { key: { fromMe: true } }));
+  up(conn, msg('.--ping', { key: { fromMe: true } }));
   assert.ok(await until(() => conn.sent.length === 1));
   assert.match(conn.sent[0].content.text, /^pong/);
 });
 test('strangers are ignored unless PUBLIC; owner-only stays blocked', async () => {
   let t = await setup();
-  up(t.conn, msg('.ping')); await sleep(80);
+  up(t.conn, msg('.--ping')); await sleep(80);
   assert.equal(t.conn.sent.length, 0);
   t = await setup({ PUBLIC: 'true' });
-  up(t.conn, msg('.ping'), msg('.status'));
+  up(t.conn, msg('.--ping'), msg('.--status'));
   assert.ok(await until(() => t.conn.sent.length === 2));
-  assert.deepEqual(t.conn.sent.map((x) => x.content.text).sort().map((s) => s.slice(0, 4)), ['Owne', 'pong']);
+  assert.deepEqual(t.conn.sent.map((x) => x.content.text).sort().map((s) => s.replace(/^[_*]+/, '').slice(0, 4)), ['Owne', 'pong']);
 });
 test('ALLOWED numbers can run commands', async () => {
   const { conn } = await setup({ ALLOWED: '15559998888' });
-  up(conn, msg('.status'));
+  up(conn, msg('.--status'));
   assert.ok(await until(() => conn.sent.length === 1));
   assert.match(conn.sent[0].content.text, /State: open/);
 });
 test('stale, own-output and non-notify messages are ignored', async () => {
   const { conn, store } = await setup();
-  up(conn, msg('.ping', { key: { fromMe: true }, top: { messageTimestamp: Math.floor(Date.now() / 1000) - 3600 } }));
-  store.markSent('SELF1'); up(conn, msg('.ping', { key: { fromMe: true, id: 'SELF1' } }));
-  conn.emit('messages.upsert', { type: 'append', messages: [msg('.ping', { key: { fromMe: true } })] });
+  up(conn, msg('.--ping', { key: { fromMe: true }, top: { messageTimestamp: Math.floor(Date.now() / 1000) - 3600 } }));
+  store.markSent('SELF1'); up(conn, msg('.--ping', { key: { fromMe: true, id: 'SELF1' } }));
+  conn.emit('messages.upsert', { type: 'append', messages: [msg('.--ping', { key: { fromMe: true } })] });
   await sleep(100);
   assert.equal(conn.sent.length, 0);
 });
@@ -91,7 +97,7 @@ test('plugins load, isolate failures, and hot reload', async () => {
   const r = await plugins.reload();
   assert.equal(r.failed.length, 2);
   assert.ok(plugins.resolve('yo') && plugins.resolve('ping').plugin === 'core');
-  up(conn, msg('.yo there', { key: { fromMe: true } }));
+  up(conn, msg('.--yo there', { key: { fromMe: true } }));
   assert.ok(await until(() => conn.sent.length === 1));
   assert.equal(conn.sent[0].content.text, 'yo there');
   await fs.rm(path.join(dir, 'good.js'));
@@ -102,10 +108,10 @@ test('a crashing command reports an error and the bot keeps working', async () =
   const { dir, conn, plugins } = await setup();
   await fs.writeFile(path.join(dir, 'crash.js'), "export default { name:'crash', commands:{ crash:{ run(){ throw new Error('nope') } } } }");
   await plugins.reload();
-  up(conn, msg('.crash', { key: { fromMe: true } }));
+  up(conn, msg('.--crash', { key: { fromMe: true } }));
   assert.ok(await until(() => conn.sent.length === 1));
-  assert.match(conn.sent[0].content.text, /Command failed: nope/);
-  up(conn, msg('.ping', { key: { fromMe: true } }));
+  assert.match(conn.sent[0].content.text, /Command failed.*nope/);
+  up(conn, msg('.--ping', { key: { fromMe: true } }));
   assert.ok(await until(() => conn.sent.length === 2));
 });
 test('plugin event handlers receive baileys events', async () => {
@@ -118,9 +124,23 @@ test('plugin event handlers receive baileys events', async () => {
 
 test('own commands are never deleted (even if HIDE_COMMANDS is still set)', async () => {
   const { conn } = await setup({ HIDE_COMMANDS: 'true' });
-  up(conn, msg('.ping', { key: { fromMe: true } }));
+  up(conn, msg('.--ping', { key: { fromMe: true } }));
   assert.ok(await until(() => conn.sent.length === 1));
   await sleep(150);
   assert.equal(conn.sent.length, 1);
   assert.ok(!conn.sent.some((x) => x.content?.delete));
+});
+
+test('changing a _helper file asks for a restart; a normal plugin only reloads', async () => {
+  const { dir, config, conn, plugins } = await setup();
+  let restarts = 0;
+  const pm = new PluginManager({ config, log: silent, api: plugins.api, conn, onHelperChanged: () => { restarts++; } });
+  pm.watch();
+  await fs.writeFile(path.join(dir, 'plain.js'), "export default { name:'plain' }");
+  await sleep(2200);
+  assert.equal(restarts, 0);
+  assert.ok(pm.plugins.has('plain'));
+  await fs.writeFile(path.join(dir, '_helper.js'), 'export const x = 1;');
+  assert.ok(await until(() => restarts === 1, 4000));
+  await pm.stop();
 });

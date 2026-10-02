@@ -4,8 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-const a = await import(fileURLToPath(new URL('../plugins/_audio.js', import.meta.url)));
+const a = await import('../plugins/_audio.js');
 
 const chunk = (id, size) => { const b = Buffer.alloc(8); b.write(id, 0, 'ascii'); b.writeUInt32LE(size, 4); return b; };
 const SR = 32000;

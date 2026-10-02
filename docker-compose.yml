@@ -1,0 +1,19 @@
+services:
+  lohra:
+    build: .
+    image: lohra:latest
+    container_name: lohra
+    restart: unless-stopped
+    user: "1001:1001"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./plugins:/app/plugins
+    mem_limit: 512m
+    cpus: 0.5
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,5 +1,5 @@
 {
-  "_help": "Add contacts as \"Name\": \"+countrycode number\" or \"Name\": { \"number\": \"+...\", \"aliases\": [\"nickname\"] }. Groups: { \"jid\": \"12036...@g.us\" }. Keys starting with _ are ignored. Or use: Lohra add contact 090... as Thomas alias Mr. T",
+  "_help": "Add people as \"Name\": \"+countrycode number\" or \"Name\": { \"number\": \"+...\", \"aliases\": [\"nickname\"] }. Groups: { \"jid\": \"12036...@g.us\" }. Keys starting with _ are ignored. Or use: wabctl contacts add NAME NUMBER",
   "Test Contact": {
     "number": "+2348012345678",
     "aliases": [

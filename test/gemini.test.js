@@ -2,8 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
-
-const g = await import(fileURLToPath(new URL('../plugins/_gemini.js', import.meta.url)));
+const g = await import('../plugins/_gemini.js');
 
 /** A scripted stand-in for the `ws` WebSocket: handler(msg, ws) answers each client message. */
 function fakeWS(handler, { autoSetup = true } = {}) {
@@ -269,7 +268,7 @@ test('cleanVocab: caps length and count, drops non-strings', () => {
 });
 
 test('PIDGIN_VOCAB: 100 clean, unique terms', async () => {
-  const { PIDGIN_VOCAB } = await import(fileURLToPath(new URL('../plugins/_vocab.js', import.meta.url)));
+  const { PIDGIN_VOCAB } = await import('../plugins/_vocab.js');
   assert.equal(PIDGIN_VOCAB.length, 100);
   assert.equal(g.cleanVocab(PIDGIN_VOCAB).length, 100);
 });

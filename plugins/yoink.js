@@ -6,6 +6,7 @@ import path from 'node:path';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import https from 'node:https';
 
 const num = (v, d) => (v == null || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
 const MAX_MB = num(process.env.YOINK_MAX_MB, 95);          // biggest file we will send
@@ -109,7 +110,8 @@ export function classify(text) {
 
 // ---------- process runner ----------
 const S = { dataDir: './data', log: console, queue: [], active: new Set(), children: new Set(), timers: [], disposed: false, updating: null, lastUpdate: 0, lastBy: new Map() };
-const BIN = () => path.join(S.dataDir, 'bin', 'yt-dlp');
+const isWin = process.platform === 'win32';
+const BIN = () => path.join(S.dataDir, 'bin', isWin ? 'yt-dlp.exe' : 'yt-dlp');
 const ENV = () => ({ ...process.env, HOME: path.join(S.dataDir, 'home'), XDG_CACHE_HOME: path.join(S.dataDir, 'cache'), PYTHONDONTWRITEBYTECODE: '1' });
 const tail = (s, n) => (s.length > n ? s.slice(-n) : s);
 
@@ -129,12 +131,41 @@ export function exec(bin, args, { timeoutMs = 60_000 } = {}) {
   });
 }
 
+import fsSync from 'node:fs';
+
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) return reject(new Error(`Status ${res.statusCode}`));
+      const file = fsSync.createWriteStream(dest);
+      res.pipe(file);
+      file.on('finish', () => { file.close(); resolve(); });
+      file.on('error', (err) => { fs.unlink(dest).catch(()=>{}); reject(err); });
+    }).on('error', reject);
+  });
+}
+
 async function ensureBinary() {
   await fs.mkdir(path.join(S.dataDir, 'bin'), { recursive: true });
   await fs.mkdir(path.join(S.dataDir, 'cache'), { recursive: true });
   await fs.mkdir(path.join(S.dataDir, 'home'), { recursive: true });
   const ok = await fs.stat(BIN()).then((s) => s.size > 100_000, () => false);
-  if (!ok) { await fs.copyFile('/usr/local/bin/yt-dlp', BIN()); await fs.chmod(BIN(), 0o755); }
+  if (!ok) {
+    try {
+      // Try to copy from Docker global location first
+      await fs.copyFile('/usr/local/bin/yt-dlp', BIN());
+      await fs.chmod(BIN(), 0o755);
+    } catch {
+      // If it fails (e.g. running on local Windows machine), download directly
+      const url = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp${isWin ? '.exe' : ''}`;
+      S.log.info(`Downloading yt-dlp from ${url}`);
+      await downloadFile(url, BIN());
+      if (!isWin) await fs.chmod(BIN(), 0o755);
+    }
+  }
 }
 
 export async function ytVersion() {
@@ -152,7 +183,14 @@ function updateYtdlp() {
       const after = await ytVersion();
       S.lastUpdate = Date.now();
       S.log.info({ before, after, code: r.code }, 'yt-dlp update check');
-      if (after === 'unknown') { await fs.copyFile('/usr/local/bin/yt-dlp', BIN()); await fs.chmod(BIN(), 0o755); } // corrupt update -> restore
+      if (after === 'unknown') {
+        try {
+          await fs.copyFile('/usr/local/bin/yt-dlp', BIN());
+          await fs.chmod(BIN(), 0o755);
+        } catch {
+          // Ignore copy errors on local fallback
+        }
+      } // corrupt update -> restore
       return { before, after };
     } catch (err) {
       S.log.warn({ err: err.message }, 'yt-dlp update failed');
@@ -293,7 +331,7 @@ async function runJob(job) {
   } catch (err) {
     const known = err instanceof UserError;
     if (!known) S.log.error({ host: hostOf(job.url), err: err.message }, 'yoink failed');
-    await job.ctx.reply(`❌ ${known ? err.message : 'Something went wrong while yoinking. Try again in a bit.'}`).catch(() => {});
+    await job.ctx.reply(`${known ? err.message : '_Something went wrong while yoinking. Try again in a bit..._'}`).catch(() => {});
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -314,7 +352,7 @@ function quotedText(msg) {
   return q?.conversation || q?.extendedTextMessage?.text || q?.imageMessage?.caption || q?.videoMessage?.caption || '';
 }
 
-const USAGE = 'Usage: yoink <link>\nAlso: yoink mp3 <link> (audio only), or reply to a message containing a link with "yoink".';
+const USAGE = '*Usage: Lohra --yoink <link>*\n_Also: Lohra --yoink mp3 <link> (audio only), or reply to a message containing a link with "Lohra --yoink"._';
 
 export default {
   name: 'yoink',
@@ -346,7 +384,7 @@ export default {
         }
         if (sub === 'update') {
           const r = await updateYtdlp();
-          return void await ctx.reply(r ? (r.before === r.after ? `yt-dlp is up to date (${r.after}).` : `yt-dlp updated ${r.before} -> ${r.after}.`) : 'Update failed, see logs.');
+          return void await ctx.reply(r ? (r.before === r.after ? `_yt-dlp is up to date_ (${r.after}).` : `*yt-dlp updated* ${r.before} -> ${r.after}.`) : '_Update failed, check the logs._');
         }
         let text = ctx.argText; let audio = false;
         if (/^(mp3|audio)(\s|$)/i.test(text)) { audio = true; text = text.replace(/^(mp3|audio)\s*/i, ''); }
@@ -355,18 +393,18 @@ export default {
         if (!urls.length) return void await ctx.reply(USAGE);
 
         const now = Date.now();
-        if (now - (S.lastBy.get(ctx.sender) || 0) < COOLDOWN_MS) return void await ctx.reply('Easy, one moment please.');
+        if (now - (S.lastBy.get(ctx.sender) || 0) < COOLDOWN_MS) return void await ctx.reply('_Easy there, give me a sec._');
         S.lastBy.set(ctx.sender, now);
         if (S.lastBy.size > 200) S.lastBy.clear();
 
         for (const raw of urls) {
           let href;
-          try { href = await assertPublicUrl(raw); } catch (err) { await ctx.reply(`❌ ${err instanceof UserError ? err.message : 'Bad link.'}`); continue; }
-          if ([...S.queue, ...S.active].some((j) => j.url === href && j.ctx.jid === ctx.jid)) { await ctx.reply('Already on that one.'); continue; }
-          if (S.queue.length >= MAX_QUEUE) { await ctx.reply('Queue is full, try again shortly.'); break; }
+          try { href = await assertPublicUrl(raw); } catch (err) { await ctx.reply(`${err instanceof UserError ? err.message : "_That link doesn't look right._"}`); continue; }
+          if ([...S.queue, ...S.active].some((j) => j.url === href && j.ctx.jid === ctx.jid)) { await ctx.reply("_I'm already working on that one!_"); continue; }
+          if (S.queue.length >= MAX_QUEUE) { await ctx.reply('_Queue is packed right now. Try again in a bit._'); break; }
           const pos = S.queue.length + S.active.size;
           S.queue.push({ id: crypto.randomBytes(6).toString('hex'), url: href, audio, ctx, cancelled: false });
-          await ctx.reply(pos ? `⏳ Queued (#${pos + 1}).` : '⏳ Yoinking...').catch(() => {});
+          await ctx.reply(pos ? `_Queued up!_ (#${pos + 1})` : '_Yoinking..._').catch(() => {});
           pump();
         }
       },

@@ -4,6 +4,7 @@
 // Keys starting with "_" are ignored (use them for notes).
 import fs from 'node:fs/promises';
 import { atomicWrite } from '../src/util.js';
+import { suggest as suggestNames } from './_names.js';
 
 export const norm = (s) => String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
   .replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
@@ -137,7 +138,9 @@ export function resolveRecipient(contacts, query, { allowRaw = true, defaultCc =
   const hits = scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score);
   if (!hits.length) {
     const near = contacts.map((c) => ({ c, s: Math.max(0, ...c.names.map((n) => sim(n, q))) })).sort((a, b) => b.s - a.s).slice(0, 3).filter((x) => x.s > 0.4);
-    return { status: 'none', suggestions: near.map((x) => x.c) };
+    const sounds = suggestNames(raw, contacts).map((x) => x.contact); // sound-alikes first ("pressure" -> Precious)
+    const merged = [...new Map([...sounds, ...near.map((x) => x.c)].map((c) => [c.jid, c])).values()].slice(0, 3);
+    return { status: 'none', suggestions: merged };
   }
   const top = hits[0].score;
   const tied = hits.filter((h) => h.score >= top - 5);

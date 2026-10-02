@@ -4,9 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-const file = fileURLToPath(new URL('../plugins/voice.js', import.meta.url));
-const v = await import(file);
+const v = await import('../plugins/voice.js');
 
 const user = { id: '15550001111:7@s.whatsapp.net', lid: '99887766:7@lid' };
 const vn = (over = {}, ptt = true) => ({

@@ -270,7 +270,7 @@ test('audit log records the lifecycle', async () => {
   assert.deepEqual(lines.map((l) => l.event), ['proposed', 'declined']);
 });
 
-test('control socket round trip (0600) and cleanup on stop', async () => {
+test('control socket round trip (0600) and cleanup on stop', { skip: process.platform === 'win32' }, async () => {
   const { agent, dir } = await setup();
   const sock = path.join(dir, 'agent', 'control.sock');
   assert.equal((await fs.stat(sock)).mode & 0o777, 0o600);
@@ -387,48 +387,8 @@ test('agent contact command adds, lists, and removes via WhatsApp command interf
   await agentPlugin.dispose();
 });
 
-test('agent command handles text instructions via command/cmd', async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-cmd-'));
-  const conn = fakeConn();
-  const store = createStore();
-  const api = { config: { dataDir: dir, allowed: [] }, conn, store, log: silent, startedAt: 1000, send: async () => ({}) };
-  await agentPlugin.init(api);
-
-  const replies = [];
-  const makeCtx = (argText) => ({
-    command: 'command',
-    argText,
-    args: argText ? argText.split(/\s+/) : [],
-    reply: async (msg) => { replies.push(msg); },
-    react: async () => {},
-  });
-
-  // Empty instruction gives usage
-  await agentPlugin.commands.command.run(makeCtx(''));
-  assert.ok(replies.some((t) => t.includes('Usage: Lohra command')));
-
-  // Paused agent reports paused
-  replies.length = 0;
-  await api.agent.setPaused(true);
-  await agentPlugin.commands.command.run(makeCtx('tell Thomas I am late'));
-  assert.ok(replies.some((t) => t.includes('Agent actions are paused')));
-
-  // No Gemini key reports missing key
-  delete process.env.GEMINI_API_KEY;
-  await api.agent.setPaused(false);
-  replies.length = 0;
-  await agentPlugin.commands.command.run(makeCtx('tell Thomas I am late'));
-  assert.ok(replies.some((t) => t.includes('Gemini API key is not configured')));
-
-  // Mock runCommand to test successful execution
-  replies.length = 0;
-  process.env.GEMINI_API_KEY = 'mock_key';
-  api.agent.runCommand = async () => ({
-    text: 'I asked for your approval.',
-    trace: [{ tool: 'send_message', ok: true, status: 'pending' }]
-  });
-  await agentPlugin.commands.command.run(makeCtx('tell Thomas I will be late'));
-  assert.ok(replies.some((t) => t.includes('🤖') && t.includes('approval')));
-
-  await agentPlugin.dispose();
+test('command/cmd/do is safely removed from agent plugin', async () => {
+  assert.equal(agentPlugin.commands.command, undefined);
+  assert.equal(agentPlugin.commands.cmd, undefined);
+  assert.equal(agentPlugin.commands.do, undefined);
 });

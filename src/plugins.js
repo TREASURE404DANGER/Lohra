@@ -20,8 +20,8 @@ export class PluginManager {
   #watcher = null;
   #debounce = null;
 
-  constructor({ config, log, api, conn, builtinDir = path.join(HERE, 'builtin') }) {
-    Object.assign(this, { cfg: config, log, api, conn, builtinDir });
+  constructor({ config, log, api, conn, builtinDir = path.join(HERE, 'builtin'), onHelperChanged = null }) {
+    Object.assign(this, { cfg: config, log, api, conn, builtinDir, onHelperChanged });
     this.plugins = new Map();  // name -> { name, mod, source, file }
     this.commands = new Map(); // command or alias -> { command, plugin, name }
     this.failed = [];
@@ -111,12 +111,25 @@ export class PluginManager {
     });
   }
 
-  /** Reload automatically when files in plugins/ change. */
+  /**
+   * Reload automatically when files in plugins/ change.
+   * Helper modules (files starting with "_") are imported statically and cached by Node, so a plain reload would keep running
+   * their OLD code. When one changes, onHelperChanged() is called after reloading so the process can restart and really pick it up.
+   */
   watch() {
+    let helper = false;
     try {
-      this.#watcher = watch(this.cfg.pluginsDir, { recursive: true }, () => {
+      this.#watcher = watch(this.cfg.pluginsDir, { recursive: true }, (_ev, file) => {
+        if (file && /(^|[\\/])_[^\\/]*\.m?js$/.test(file) && !/\.test\.m?js$/.test(file)) helper = true;
         clearTimeout(this.#debounce);
-        this.#debounce = setTimeout(() => this.reload().catch((err) => this.log.error({ err: err.message }, 'auto-reload failed')), 700);
+        this.#debounce = setTimeout(async () => {
+          await this.reload().catch((err) => this.log.error({ err: err.message }, 'auto-reload failed'));
+          if (helper && this.onHelperChanged) {
+            helper = false;
+            this.log.warn('a helper file (_*.js) changed: restarting so the new code is used');
+            this.onHelperChanged();
+          }
+        }, 1500);
       });
       this.#watcher.on('error', () => {});
     } catch (err) {

@@ -1,4 +1,6 @@
-// Tool surface + rules for the in-bot voice agent (Gemini 3.8 Live). Keep in sync with TOOLS in cli/wabctl.
+// Tool surface + rules for the in-bot agent (Gemini 3.8 Live), used by voice notes ending in "this is a command" AND by "Lohra command <text>".
+// The model can only do what is listed here: if a capability is missing from TOOL_DECLS/SYSTEM_PROMPT it effectively does not exist for the agent.
+// Keep in sync with TOOLS in cli/wabctl (test/agenttools.test.js checks the tool names match).
 // No wait_for_action here: the owner answers on their phone, and the agent itself posts the outcome in the chat.
 import { words } from './_gemini.js';
 
@@ -16,6 +18,16 @@ export function parseVoiceCommand(text) {
   return { command: t.slice(0, m.index).replace(/[\s,;:\-–—]+$/, '').trim() };
 }
 
+// "this is not a command" (or "this isn't a command") at the END forces a plain transcript and skips the command check
+const NOT_END = /(?:^|[\s,.;:!?\-–—"'“”‘’(\[])this\s+(?:is\s+not|isn['’]?t|is\s+no)\s+(?:a\s+)?command[\s.!?,;:…"'“”‘’)\]]*$/i;
+
+/** -> null (phrase not at the end) | { text } where text is what was said before the phrase (may be empty). */
+export function parseNotCommand(text) {
+  const t = String(text ?? '').trim();
+  const m = NOT_END.exec(t);
+  return m ? { text: t.slice(0, m.index).replace(/[\s,;:\-–—]+$/, '').trim() } : null;
+}
+
 const str = (description) => ({ type: 'string', description });
 export const TOOL_DECLS = [
   {
@@ -28,8 +40,23 @@ export const TOOL_DECLS = [
     description: "Put a drafted message into the owner's own chat so they can edit and send it themselves. Nothing goes to the recipient. Use when the owner says draft, write or prepare.",
     parameters: { type: 'object', properties: { to: str('Contact name or full phone number.'), text: str('The draft text.') }, required: ['to', 'text'] },
   },
+  {
+    name: 'send_bulk',
+    description: "Ask the owner to send ONE message to SEVERAL people: a list of contacts, or all contacts. Use for 'send X to everyone / all my contacts', 'message A, B and C', 'wish everyone happy new month'. Never for a single person (use send_message). Nothing is sent yet: the owner sees the full list and the text in their own chat and answers with a reaction (👍 send to all, 🙏 draft only, 😢 decline). After approval the messages go out one by one with a short pause, and the owner can stop it with 'Lohra agent stop'. Returns an action id with status 'pending'. Do not wait for the answer.",
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'array', items: { type: 'string' }, description: "Contact names exactly as the owner said them. Leave out when the owner means everyone." },
+        all_contacts: { type: 'boolean', description: "true when the owner means everyone / all my contacts / all of them." },
+        except: { type: 'array', items: { type: 'string' }, description: "Names to leave out ('everyone except Mum')." },
+        text: str("The exact message, in the owner's voice. Use {name} only if the owner asked for each person's name to be included."),
+        delay_seconds: { type: 'integer', description: "Pause between messages in seconds, only if the owner named one. Default 2, range 1 to 60." },
+      },
+      required: ['text'],
+    },
+  },
   { name: 'check_action', description: 'Status of an earlier action: pending, sent, drafted, declined, expired, cancelled or failed.', parameters: { type: 'object', properties: { id: str('Action id.') }, required: ['id'] } },
-  { name: 'cancel_action', description: 'Cancel a request that is still pending.', parameters: { type: 'object', properties: { id: str('Action id.') }, required: ['id'] } },
+  { name: 'cancel_action', description: 'Cancel a request that is still pending, or stop a broadcast that is currently sending (people after the point of stopping do not get it).', parameters: { type: 'object', properties: { id: str('Action id.') }, required: ['id'] } },
   { name: 'list_pending', description: 'List requests waiting for the owner and the most recent finished ones.' },
   { name: 'find_contact', description: "Check who a spoken name refers to in the owner's contacts (handles nicknames and mishearings). Returns the match or candidates. Numbers are masked.", parameters: { type: 'object', properties: { query: str('The name as heard.') }, required: ['query'] } },
   { name: 'list_contacts', description: "List the names in the owner's contact book." },
@@ -37,7 +64,7 @@ export const TOOL_DECLS = [
   { name: 'bot_status', description: 'Whether the bot is connected and whether agent actions are paused.' },
   {
     name: 'get_contact_status',
-    description: "Check a contact's latest WhatsApp status/story update and download/send it to the owner. Use when the owner asks to check someone's status, download their last status, get the meme they posted, see their story, etc.",
+    description: "ONE-TIME look: fetch the status/story a contact has ALREADY posted (their latest) and send it to the owner now. Use for 'check X's status', 'get / download X's last status or meme', 'what did X post', 'show me X's story'. Do NOT use when the owner wants to hear about FUTURE or REPEATED updates (periodically, keep checking, whenever, as soon as): that is watch_contact.",
     parameters: {
       type: 'object',
       properties: {
@@ -46,23 +73,87 @@ export const TOOL_DECLS = [
       required: ['contact'],
     },
   },
+  {
+    name: 'watch_contact',
+    description: "ONGOING monitoring: keep an eye on a contact and send the owner every NEW status or message that matches, with its media, in the owner's own chat. Nothing is ever sent to the contact. Use for ANY request about the future or repeating: periodically, regularly, from time to time, keep checking, keep an eye on, monitor, track, watch, whenever, every time, as soon as, when they post, let me know / tell me / alert me when or if. It reacts the moment something new arrives (it is not a clock or timer). Do NOT use for a one-time look at what was already posted: that is get_contact_status.",
+    parameters: {
+      type: 'object',
+      properties: {
+        contact: str("Contact name as the owner said it, or a full phone number."),
+        kind: { type: 'string', enum: ['status', 'message'], description: "'status' for a status, story or update; 'message' for chat messages, texts or voice notes." },
+        condition: str("Optional filter in a few words, such as 'is a meme' or 'mentions food'. Leave empty when any new item counts."),
+        keep_watching: { type: 'boolean', description: 'true when the wording repeats or is open-ended (periodically, keep, every, whenever, any, all); false only for a single next item (the next one, once, as soon as).' },
+        hours: { type: 'integer', description: "How long to keep watching, in hours. 'for 3 days' = 72, 'today' = 24, 'this week' = 168. Default 168 when not stated." },
+      },
+      required: ['contact', 'kind', 'keep_watching'],
+    },
+  },
+  {
+    name: 'find_messages',
+    description: "LOOK BACK in the owner's saved WhatsApp chats. Use for 'the last voice note Precious sent', 'what did Thomas say about the meeting', 'find the photo I sent Mary', 'get / send me the last video from X', 'check my chat with X'. Read-only: nothing is sent to the contact. Newest first, each with an id. Set deliver_newest=true when the owner wants the item itself ('send it here', 'forward it', 'let me hear it'): the newest match is then sent to the owner's own chat in the same step. Only messages the bot saw while connected are saved (about 30 days): if nothing is found, say so plainly and offer watch_contact for future ones. Do NOT use for statuses/stories (that is get_contact_status) or for things that have not happened yet (watch_contact).",
+    parameters: {
+      type: 'object',
+      properties: {
+        contact: str("The person (or group) whose chat to search, as the owner said it (e.g. 'Precious'), or a full phone number."),
+        kind: { type: 'string', enum: ['any', 'text', 'voice', 'image', 'video', 'document', 'sticker'], description: "'voice' = voice notes and audio, 'image' = photos/memes, 'video', 'document' = files, 'text' = written messages. Default any." },
+        from: { type: 'string', enum: ['any', 'them', 'me'], description: "'them' = sent by the contact, 'me' = sent by the owner. Default any." },
+        query: str('Optional words the message must contain (text or caption), e.g. a topic. Leave empty to just take the latest.'),
+        limit: { type: 'integer', description: 'How many to list, 1-10 (default 5).' },
+        hours: { type: 'integer', description: "Only messages from the last N hours ('today' = 24, 'this week' = 168). Leave out for all saved." },
+        deliver_newest: { type: 'boolean', description: "true = also send the newest match to the owner's own chat (voice notes arrive as voice notes, photos as photos)." },
+      },
+      required: ['contact'],
+    },
+  },
+  {
+    name: 'deliver_to_owner',
+    description: "Send ONE saved message found with find_messages (voice note, photo, video, file or text) to the owner's own chat. Use when the owner picks a different one than the newest. It never goes to the contact.",
+    parameters: { type: 'object', properties: { id: str('The message id from find_messages.') }, required: ['id'] },
+  },
+  { name: 'list_watches', description: "List the owner's active watches (who, what, how long left) and the last few finished ones." },
+  { name: 'cancel_watch', description: "Stop a watch so it no longer reports new items. Use for 'stop watching X', 'cancel that', 'forget it'; pass the id, the contact name, or 'all'.", parameters: { type: 'object', properties: { id: str("The watch id from watch_contact or list_watches, a contact name, or 'all'.") }, required: ['id'] } },
 ];
 
-export const SYSTEM_PROMPT = `You are the owner's WhatsApp assistant, running inside their own WhatsApp bot. The owner recorded a voice note that was transcribed by speech-to-text, so names and words can be slightly wrong. The text you receive is the owner's own spoken instruction.
-Rules:
-1. Only do what the note asks, using your tools. If it is not a clear request for one of your tools, say so in one short sentence and do nothing.
+export const SYSTEM_PROMPT = `You are the owner's WhatsApp assistant, running inside their own WhatsApp bot. The owner gave an instruction by voice note or typed text; voice notes are transcribed by speech-to-text, so names and words can be slightly wrong. The text you receive is the owner's own instruction.
+
+WHAT YOU CAN DO. These tools are the complete list; you can do nothing else.
+- Messages: send_message (one person, asks the owner to approve first), send_bulk (the same message to several people or all contacts, one approval, sent one by one with a pause), draft_message (puts a draft in the owner's own chat).
+- A status that is already posted, one time: get_contact_status.
+- Looking back at saved chats: find_messages (voice notes, photos, videos, files, texts a contact sent or the owner sent), deliver_to_owner (send a found one to the owner's own chat).
+- Watching over time: watch_contact (ongoing, for statuses or messages, optionally only those matching a condition), list_watches, cancel_watch.
+- Helpers: find_contact, list_contacts, check_action, cancel_action, list_pending, notify_owner, bot_status.
+
+HOW TO READ LOOSE WORDING
+- "check X's status", "get / download X's last status or meme", "what did X post", "show me X's story" = one look at what is ALREADY there: get_contact_status.
+- Anything about the FUTURE or REPEATING is watch_contact, never get_contact_status. Cue words: periodically, regularly, from time to time, keep checking, keep an eye on, monitor, track, watch, whenever, every time, any time, as soon as, when X posts, let me know / tell me / alert me / notify me when or if. Example: "periodically check Precious's status for any meme update" = watch_contact(contact "Precious", kind "status", condition "is a meme", keep_watching true).
+- Looking back: "check my chat with X and find / send me the last voice note", "what did X say about ...", "find the photo I sent X", "get me the last video from X" = find_messages (kind voice / image / video / document / text; deliver_newest=true when the owner wants the item itself, e.g. "send it here"). Example: "check my chat with Precious and find the last voice note that was sent there and send it here" = find_messages(contact "Precious", kind "voice", deliver_newest true). Chats are saved only from the moment the bot saw them (about 30 days): if nothing is found, say that plainly and never pretend; offer watch_contact for future ones. Never say you cannot look at past messages: you can, from the saved chats.
+- watch_contact is not a timer. It reacts the moment a new item arrives and posts matches, with the media, in the owner's own chat. If the owner names a schedule ("every hour", "every morning"), say in one sentence that you watch continuously instead, and still create the watch. You cannot run other scheduled jobs, reminders or timers.
+- kind: "status" for a status, story or update; "message" for chat messages, texts or voice notes.
+- condition: the filter in a few words ("is a meme", "mentions food"); leave it out when any new item counts.
+- keep_watching: true for repeated or open-ended wording (periodically, keep, every, whenever, any, all); false only for a single next item ("the next one", "once", "as soon as").
+- hours: "for 3 days" = 72, "today" = 24, "this week" = 168; leave it out when not stated.
+
+BROADCASTS
+- "send X to everyone", "message all my contacts", "wish everybody happy new month", "tell A, B and C that ..." = send_bulk. Everyone = all_contacts true; "everyone except Mum" = all_contacts true plus except. One person = send_message, never send_bulk.
+- Keep the message exactly as dictated. Use {name} only when the owner asks for each person's name in it ("with their names", "personal"). Set delay_seconds only when the owner names a pause.
+- After send_bulk, tell the owner to react to the request in their chat (👍 sends to all, one by one; Lohra agent stop ends it early). Never say it was sent.
+- If send_bulk reports too_many_recipients, daily_limit or bulk_busy, say that plainly in one sentence and do nothing else.
+
+RULES
+1. Only do what the instruction asks, using your tools. If it is not a clear request for one of your tools, or it needs something you cannot do, say so in one short sentence, say what you can do instead, and do nothing.
 2. send_message never sends by itself: it asks the owner to approve on their phone (👍 send now, 🙏 draft, 😢 decline). Do not wait. After calling it, tell the owner to react to the request in their chat. Never say a message was sent.
 3. If the owner says draft, write or prepare, use draft_message.
-4. Write the message in the owner's voice, as dictated. Fix obvious speech-to-text slips and punctuation, never add content they did not ask for, and leave out the instruction itself ("send a message to Thomas saying ...").
+4. Write messages in the owner's voice, as dictated. Fix obvious speech-to-text slips and punctuation, never add content they did not ask for, and leave out the instruction itself ("send a message to Thomas saying ...").
 5. If you are unsure who a name means, call find_contact. If it is ambiguous or not found, ask the owner in one short sentence and do nothing else. Never invent or guess phone numbers.
-6. Reply in one or two short plain-text sentences, no lists, no markdown.
-7. If the owner asks to check someone's status, download their last status/meme, or see their story, call get_contact_status with their name.`;
+6. After watch_contact succeeds, say in one sentence who is being watched, for what, and that matches will appear in their chat. If it returns already_watching, say so. Never claim you already checked something that a watch will only catch in the future.
+7. Reply in one or two short plain-text sentences, no lists, no markdown.`;
 
 /** Map tool calls onto the Agent's own operations (same code path, limits and approval as the CLI). */
 export function makeDispatch(agent) {
   const s = (v) => (typeof v === 'string' ? v : undefined);
   const table = {
     send_message: (a) => agent.handle({ op: 'send', to: s(a.to), text: s(a.text), source: 'voice' }),
+    send_bulk: (a) => agent.handle({ op: 'send.bulk', to: a.to, all: a.all_contacts, except: a.except, text: s(a.text), delay_sec: a.delay_seconds, source: 'voice' }),
     draft_message: (a) => agent.handle({ op: 'draft', to: s(a.to), text: s(a.text), source: 'voice' }),
     check_action: (a) => agent.handle({ op: 'get', id: s(a.id) }),
     cancel_action: (a) => agent.handle({ op: 'cancel', id: s(a.id) }),
@@ -71,7 +162,12 @@ export function makeDispatch(agent) {
     list_contacts: () => agent.handle({ op: 'contacts.list' }),
     notify_owner: (a) => agent.handle({ op: 'notify', text: s(a.text) }),
     bot_status: () => agent.handle({ op: 'status' }),
+    find_messages: (a) => agent.handle({ op: 'msgs.find', contact: s(a.contact), kind: s(a.kind), from: s(a.from), query: s(a.query), limit: a.limit, hours: a.hours, deliver_newest: a.deliver_newest, source: 'voice' }),
+    deliver_to_owner: (a) => agent.handle({ op: 'msgs.send', id: s(a.id), source: 'voice' }),
     get_contact_status: (a) => agent.handle({ op: 'status.get', contact: s(a.contact) }),
+    watch_contact: (a) => agent.handle({ op: 'watch.add', contact: s(a.contact), kind: s(a.kind), condition: s(a.condition), keep_watching: a.keep_watching, hours: a.hours, source: 'voice' }),
+    list_watches: () => agent.handle({ op: 'watch.list' }),
+    cancel_watch: (a) => agent.handle({ op: 'watch.cancel', id: s(a.id) }),
   };
   return async (name, args) => {
     const fn = table[name];
@@ -81,7 +177,7 @@ export function makeDispatch(agent) {
 }
 
 /** Tools that change something (a request, a draft, a cancellation, a note). If a command fails after one of these ran, say so. */
-export const STATE_TOOLS = new Set(['send_message', 'draft_message', 'cancel_action', 'notify_owner', 'get_contact_status']);
+export const STATE_TOOLS = new Set(['send_message', 'send_bulk', 'draft_message', 'cancel_action', 'notify_owner', 'get_contact_status', 'watch_contact', 'cancel_watch', 'find_messages', 'deliver_to_owner']);
 
 const CLAIMS_DONE = /\b(sent|delivered|messaged|texted)\b/i;
 const HEDGES = /\b(approv|confirm|pending|waiting|react|draft|declin|not (?:been )?sent|nothing (?:was |has been )?sent|hasn'?t|haven'?t|yet|asked)\b/i;
@@ -92,7 +188,7 @@ const HEDGES = /\b(approv|confirm|pending|waiting|react|draft|declin|not (?:been
  */
 export function commandReply(modelText, trace = []) {
   const t = String(modelText ?? '').trim();
-  const asked = trace.some((x) => x.tool === 'send_message' && x.ok);
+  const asked = trace.some((x) => (x.tool === 'send_message' || x.tool === 'send_bulk') && x.ok);
   if (asked && (!t || (CLAIMS_DONE.test(t) && !HEDGES.test(t)))) return 'I asked for your OK on the request above: react 👍 to send, 🙏 to get it as a draft, or 😢 to decline.';
   if (t) return t;
   return trace.length ? 'Done.' : "I didn't hear a request I can act on.";

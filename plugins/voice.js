@@ -1,11 +1,13 @@
 // Voice notes you send to yourself are transcribed and answered in the same chat. No command needed.
 //   - Any length: long notes are cut at quiet moments into ~5 min pieces (a Gemini connection lives ~10 min) and joined again.
-//   - A voice note that ENDS with the exact words "this is a command" is not transcribed: it is run as an instruction by the
-//     Gemini 3.8 Live agent (agent.js), which can only propose messages; you approve with a reaction. Only your own, non-forwarded voice
-//     notes in your own chat can do this. "Lohra transcribe" never runs commands.
+//   - Command or transcript? For your own, non-forwarded voice notes in your own chat:
+//       ends with "this is a command"     -> run as an instruction by the Gemini 3.8 Live agent (agent.js), no check
+//       ends with "this is not a command" -> plain transcript (the phrase is dropped), no check
+//       neither                           -> a small Gemini model decides (_intent.js); unsure, slow or failing = transcript
+//     The agent can only propose messages (you approve with a reaction). "Lohra transcribe" and forwarded notes never run commands.
 // "Lohra transcribe" (alias "tr") as a reply to any voice note/audio transcribes that one too.
-// "Lohra voice on|off|status", "voice engine gemini|local", "voice polish on|off", "voice commands on|off" (owner only).
-// Engine gemini: Gemini 3.5 Transcribe Live (speech to text) + Gemini 3.8 Live (polish), see _gemini.js; falls back to local Phonon-2 / local LLM.
+// "Lohra voice on|off|status", "voice polish on|off", "voice commands on|off" (owner only).
+// Engine gemini: Gemini 3.5 Transcribe Live (speech to text) + Gemini 3.8 Live (polish), see _gemini.js; the old local Phonon/LLM fallback was removed (the helper code below is unused).
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -14,11 +16,12 @@ import { downloadMediaMessage, normalizeMessageContent } from 'baileys';
 import { PIDGIN_VOCAB } from './_vocab.js';
 import { geminiTranscribe, geminiPolish, cleanText, defang, scrub, looksLikeInjection, looksLikeCleanup, words, Breaker } from './_gemini.js';
 import { PCM_BYTES_PER_SEC, wavLayout, pcmToWav, scanEnergy, planSegments, readPcmRange } from './_audio.js';
-import { parseVoiceCommand } from './_agenttools.js';
+import { parseVoiceCommand, parseNotCommand } from './_agenttools.js';
+import { detectCommand, maxWords } from './_intent.js';
 import { commandReply, STATE_TOOLS } from './_agenttools.js';
 import { contactNames } from './_contacts.js';
 
-export { looksLikeCleanup, parseVoiceCommand, commandReply };
+export { looksLikeCleanup, parseVoiceCommand, parseNotCommand, commandReply };
 
 const MAX_BYTES = 100 * 1024 * 1024;  // download guard (memory): ~14 h of WhatsApp voice audio
 export const MAX_SECONDS = 3 * 3600;  // runaway guard only: a voice note this long is not a note, it is a recording
@@ -31,11 +34,12 @@ const MSG_CHARS = 3800;               // one chat message
 const MAX_PARTS = 3;                  // up to this many messages, longer transcripts go out as a .txt file
 const MAX_REPLY_CHARS = 400_000;
 const MAX_COMMAND_CHARS = 2000;
+const IMPLICIT_HINT = '\n\n(Taken as a command. End a note with "this is not a command" to get a transcript instead.)';
 const POLISH_CHUNK_WORDS_GEMINI = 350;
 const MAX_POLISH_CHUNKS = 60;         // beyond ~20 000 words the rest is sent unpolished
 
 /** Test hooks: replace the download, ffmpeg and speech-to-text steps. Never set in production. */
-export const hooks = { download: null, toWav: null, speech: null, piece: null };
+export const hooks = { download: null, toWav: null, speech: null, piece: null, intent: null };
 
 const digits = (jid) => String(jid ?? '').split('@')[0].split(':')[0].replace(/\D/g, '');
 
@@ -211,6 +215,7 @@ let api = null;
 let enabled = true;
 let polishOn = true;
 let commandsOn = true;
+let autoOn = true;                    // let the model decide when a note has neither phrase
 let enginePref = 'gemini';            // 'gemini' | 'local' (saved)
 export const breaker = new Breaker({ maxPerWindow: 60 });
 let queued = 0;
@@ -242,7 +247,7 @@ const makeIO = (ackKey, quoted) => ({
 async function sttVocab() {
   let names = [];
   try { names = contactNames(JSON.parse(await fs.readFile(path.join(api.config.dataDir, 'contacts.json'), 'utf8'))); } catch { /* no contacts yet */ }
-  return [...PIDGIN_VOCAB, 'this is a command', ...names];
+  return [...PIDGIN_VOCAB, 'this is a command', 'this is not a command', ...names];
 }
 
 /** One piece of audio (raw PCM) -> text. Gemini 3.5 Transcribe Live, falling back to local Phonon-2 for this piece on any Gemini problem. */
@@ -258,7 +263,7 @@ async function pieceToText(pcm, { vocab, dir, index }) {
       return { text: r.text, engine: 'gemini', partial: r.partial };
     } catch (err) {
       breaker.fail(err);
-      api.log.warn({ code: err.code, piece: index, ms: Date.now() - t0, seconds: Math.round(sec), err: scrub(err.message, geminiKey()) }, 'piece: gemini failed, falling back to local Phonon-2');
+      api.log.warn({ code: err.code, piece: index, ms: Date.now() - t0, seconds: Math.round(sec), err: scrub(err.message, geminiKey()) }, 'piece: gemini failed');
     }
   }
   if (process.env.PHONON_URL) {
@@ -271,7 +276,7 @@ async function pieceToText(pcm, { vocab, dir, index }) {
     api.log.info({ piece: index, ms: Date.now() - t1, chars: text.length }, 'piece: phonon transcription done');
     return { text, engine: 'phonon' };
   }
-  throw new Error('Gemini transcription failed and no local fallback is configured.');
+  throw new Error('Gemini transcription failed.');
 }
 
 /** Whole wav -> text, in pieces when it is long. The wav is read piece by piece, never loaded whole. */
@@ -310,11 +315,9 @@ async function polishText(text) {
   const t0 = Date.now();
   const wc = words(text).length;
   if (!geminiOn()) {
-    api.log.info({ words: wc, engine: 'local' }, 'polish: starting with local LLM');
-    if (looksLikeInjection(text)) { api.log.info('transcript looks like a prompt injection: not polished'); return text; }
-    const r = await polish(text, { url: process.env.LLM_URL || 'http://llm:8080', key: process.env.LLM_API_KEY, log: api.log });
-    api.log.info({ words: wc, ms: Date.now() - t0 }, 'polish: local LLM done');
-    return r;
+    // the local cleanup LLM was removed: with Gemini unavailable (no key or paused) the raw transcript is sent
+    api.log.info({ words: wc }, 'polish: Gemini unavailable, sending the raw transcript');
+    return text;
   }
   breaker.use();
   const pieces = wc > 500 ? chunkText(text, POLISH_CHUNK_WORDS_GEMINI) : [text];
@@ -344,7 +347,7 @@ async function polishText(text) {
 async function deliver(final, partial, { jid, quoted, reply, say }) {
   const note = '(This transcript may be incomplete.)';
   let out = cleanText(final || '', MAX_REPLY_CHARS);
-  if (!out) return void (await reply('(no speech detected)'));
+  if (!out) return void (await reply('_(no speech detected)_'));
   out = paragraphs(out);
   const prefix = api.config?.prefix;
   if (out.length <= MSG_CHARS) return void (await reply(defang(partial ? `${out}\n\n${note}` : out, prefix)));
@@ -364,10 +367,28 @@ async function deliver(final, partial, { jid, quoted, reply, say }) {
 // ---------- voice commands ----------
 const reasonOf = (err) => ({ quota: 'Gemini quota reached', auth: 'Gemini key problem', policy: 'Gemini refused the request', timeout: 'it took too long', rejected: 'the request looked wrong', network: 'network problem', closed: 'Gemini hung up' }[err?.code] || err?.code || 'unknown error');
 
-/** Run "<command> this is a command" through the agent. Only reached for the owner's own, non-forwarded voice notes. */
-async function runVoiceCommand(cmd, { partial, reply }) {
+const agentReady = () => !!api.agent && !api.agent.isPaused() && enginePref === 'gemini' && geminiOn();
+
+/** Should a note with neither phrase run as a command? Only when commands can actually run; any doubt or error = no (transcribe). */
+async function looksLikeCommand(text, id) {
+  if (!autoOn || !agentReady()) return false;
+  if (!words(text).length || words(text).length > maxWords() || text.length > MAX_COMMAND_CHARS || looksLikeInjection(text)) return false;
+  try {
+    const d = await (hooks.intent || detectCommand)(text, { key: geminiKey() });
+    api.log.info({ id, command: !!d.command, confidence: d.confidence }, 'handle: intent check');
+    api.log.debug({ id, reason: d.reason }, 'handle: intent reason');
+    return !!d.command;
+  } catch (err) {
+    api.log.warn({ id, err: scrub(err.message, geminiKey()) }, 'intent check failed: sending a transcript instead');
+    return false;
+  }
+}
+
+/** Run a command through the agent. Explicit ("this is a command"): always answers. Implicit (the model decided): returns false when it could not run, so the caller transcribes. */
+async function runVoiceCommand(cmd, { partial, reply, implicit = false }) {
   const say = (t) => reply(`🤖 ${t}`).catch((e) => api.log.warn({ err: e.message }, 'command reply failed'));
   const heard = cmd.command;
+  if (implicit && (partial || !heard || !agentReady())) return false;
   if (!heard) return say('I heard "this is a command" but nothing before it. Say what you want first, then end with "this is a command".');
   if (partial) return say('Your voice note may have been cut off, so I did not run it. Please say it again.');
   if (heard.length > MAX_COMMAND_CHARS) return say('That command is too long for me to run safely. Please shorten it.');
@@ -380,12 +401,15 @@ async function runVoiceCommand(cmd, { partial, reply }) {
   try {
     const r = await agent.runCommand(heard, { key: geminiKey() });
     breaker.ok();
-    await say(commandReply(r.text, r.trace));
+    await say(commandReply(r.text, r.trace) + (implicit ? IMPLICIT_HINT : ''));
+    return true;
   } catch (err) {
     breaker.fail(err);
     api.log.warn({ code: err.code, err: scrub(err.message, geminiKey()) }, 'voice command failed');
     const ran = (err.trace || []).some((x) => STATE_TOOLS.has(x.tool));
+    if (implicit && !ran) return false;   // nothing happened and the speaker never said "command": give them the transcript
     await say(`I could not finish that command (${reasonOf(err)}). ${ran ? 'Some steps may already have run: check "Lohra agent status".' : 'Nothing was done.'} I heard: "${heard}"`);
+    return true;
   }
 }
 
@@ -405,7 +429,7 @@ async function handle(m, { ackKey, quoted, hasEta, eta, allowCommand }) {
     api.log.info({ id }, 'handle: downloading media');
     const buf = await (hooks.download || downloadMediaMessage)(m, 'buffer', {}, { logger: api.log, reuploadRequest: sock.updateMediaMessage });
     api.log.info({ id, bytes: buf.length, ms: Date.now() - tStart }, 'handle: download complete');
-    if (buf.length > MAX_BYTES) return void (await reply('That voice note is too large to transcribe.'));
+    if (buf.length > MAX_BYTES) return void (await reply('_That voice note is just too large to transcribe._'));
     const src = path.join(dir, 'in.ogg');
     const wav = path.join(dir, 'out.wav');
     await fs.writeFile(src, buf);
@@ -415,14 +439,21 @@ async function handle(m, { ackKey, quoted, hasEta, eta, allowCommand }) {
     const seconds = Math.max(0, ((await fs.stat(wav)).size - 44) / PCM_BYTES_PER_SEC);
     api.log.info({ id, seconds: Math.round(seconds), ffmpegMs: Date.now() - tFfmpeg }, 'handle: ffmpeg conversion done');
     if (seconds > MAX_SECONDS + 2) return void (await reply(tooLong(seconds)));
-    if (!hasEta) await reply(`Got it. Your voice note will be ready in about ${etaText(eta + estimate(seconds))}.`).catch(() => {});
+    if (!hasEta) await reply(`_Got it. Your voice note will be ready in about ${etaText(eta + estimate(seconds))}._`).catch(() => {});
     const tStt = Date.now();
-    const { text, engine: used, partial } = await (hooks.speech || speechToText)(wav, seconds, dir);
+    const stt = await (hooks.speech || speechToText)(wav, seconds, dir);
+    let text = stt.text;
+    const { engine: used, partial } = stt;
     const sttMs = Date.now() - tStt;
     api.log.info({ id, seconds: Math.round(seconds), sttMs, chars: text.length, engine: used, partial: !!partial }, 'handle: speech-to-text done');
     if (allowCommand) {
-      const cmd = parseVoiceCommand(text);
+      const cmd = parseVoiceCommand(text);                    // "... this is a command": run it, no check
       if (cmd) return void (await runVoiceCommand(cmd, { partial, reply }));
+      const plain = parseNotCommand(text);                    // "... this is not a command": transcript, no check, phrase dropped
+      if (plain) text = plain.text;
+      else if (!partial && await looksLikeCommand(text, id)) { // neither phrase: the model decides
+        if (await runVoiceCommand({ command: text.trim() }, { partial, reply, implicit: true })) return;
+      }
     }
     const tPolish = Date.now();
     const final = text && polishOn ? await polishText(text) : text;
@@ -432,7 +463,7 @@ async function handle(m, { ackKey, quoted, hasEta, eta, allowCommand }) {
     api.log.info({ id, totalMs: Date.now() - tStart }, 'handle: delivered');
   } catch (err) {
     api.log.error({ id, err: err.message, stack: err.stack?.split('\n').slice(0, 3).join(' | '), totalMs: Date.now() - tStart }, 'voice transcription failed');
-    await reply('Could not transcribe that one. Try again in a moment.').catch(() => {});
+    await reply('_Could not transcribe that one. Try again in a moment..._').catch(() => {});
   } finally {
     await react(''); // clear the ⏳
     if (dir) fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -446,14 +477,14 @@ function enqueue(m, { ackKey = m.key, quoted = m, allowCommand = false } = {}) {
   const id = m.key?.id || 'unknown';
   api.log.info({ id, seconds: sec, queued, lane: sec > FAST_LANE_SEC ? 'slow' : 'fast', allowCommand }, 'enqueue: voice note received');
   if (sec > MAX_SECONDS) { api.log.warn({ id, seconds: sec }, 'enqueue: refused (too long)'); reply(tooLong(sec)).catch(() => {}); return; }
-  if (queued >= MAX_QUEUE) { api.log.warn({ id, queued }, 'enqueue: refused (queue full)'); reply(`I already have ${queued} voice notes waiting. Try again in a minute.`).catch(() => {}); return; }
+  if (queued >= MAX_QUEUE) { api.log.warn({ id, queued }, 'enqueue: refused (queue full)'); reply(`_I already have ${queued} voice notes waiting. Try again in a minute._`).catch(() => {}); return; }
   const lane = lanes[sec > FAST_LANE_SEC ? 'slow' : 'fast'];   // a long recording never holds up a short note or a command
   queued++;
   const own = sec ? estimate(sec) : 0;
   const ahead = lane.pending;   // work already queued in front of this note, in its own lane
   lane.pending += own;
   react('⏳');                                                            // acknowledged right away
-  if (sec) reply(`Got it. Your voice note will be ready in about ${etaText(ahead + own)}.`).catch(() => {});
+  if (sec) reply(`_Got it. Your voice note will be ready in about ${etaText(ahead + own)}._`).catch(() => {});
   lane.chain = lane.chain
     .then(() => handle(m, { ackKey, quoted, hasEta: sec > 0, eta: ahead, allowCommand }))
     .catch((err) => api.log.error({ id, err: err.message }, 'voice job failed'))
@@ -486,7 +517,8 @@ export default {
     enabled = st.enabled !== false;
     polishOn = st.polish !== false && !/^(0|false|off|no)$/i.test(process.env.POLISH || '');
     commandsOn = st.commands !== false;
-    enginePref = st.engine === 'local' ? 'local' : 'gemini';
+    autoOn = st.auto !== false;
+    enginePref = 'gemini';   // the local engine (Phonon + local LLM) was removed
   },
   on: { 'messages.upsert': (data) => onUpsert(data) },
   commands: {
@@ -496,24 +528,26 @@ export default {
       ownerOnly: true,
       run: async (ctx) => {
         const q = getQuoted(ctx.msg, ctx.jid);
-        if (!q || !normalizeMessageContent(q.message)?.audioMessage) return ctx.reply('Reply to a voice note or audio message with this command.');
+        if (!q || !normalizeMessageContent(q.message)?.audioMessage) return ctx.reply('_Reply to a voice note or audio message with this command._');
         enqueue(q, { ackKey: ctx.msg.key, quoted: q }); // runs in the background; never runs "this is a command" (allowCommand stays false)
       },
     },
     voice: {
-      description: 'voice on|off, voice polish on|off, voice commands on|off, voice engine gemini|local, voice status',
+      description: 'voice on|off, voice polish on|off, voice commands on|off, voice auto on|off, voice status',
       ownerOnly: true,
       run: async (ctx) => {
         const [a, b] = ctx.args.map((x) => x.toLowerCase());
-        const save = () => fs.writeFile(stateFile, JSON.stringify({ enabled, polish: polishOn, commands: commandsOn, engine: enginePref })).catch(() => {});
+        const save = () => fs.writeFile(stateFile, JSON.stringify({ enabled, polish: polishOn, commands: commandsOn, auto: autoOn, engine: enginePref })).catch(() => {});
         if (a === 'on' || a === 'off') { enabled = a === 'on'; await save(); }
         else if (a === 'polish' && (b === 'on' || b === 'off')) { polishOn = b === 'on'; await save(); }
         else if (a === 'commands' && (b === 'on' || b === 'off')) { commandsOn = b === 'on'; await save(); }
-        else if (a === 'engine' && (b === 'gemini' || b === 'local')) { enginePref = b; await save(); }
-        else if (a && a !== 'status') return ctx.reply('Usage: voice on|off, voice polish on|off, voice commands on|off, voice engine gemini|local, voice status');
-        const eng = enginePref === 'local' ? 'local (Phonon-2 + local LLM, private)' : !geminiKey() ? 'gemini (no API key, using local)' : `gemini (${breaker.status()})`;
-        const cmds = !commandsOn ? 'OFF' : enginePref !== 'gemini' ? 'ON but needs the gemini engine' : 'ON (end a voice note with "this is a command")';
-        return ctx.reply(`Voice transcription: ${enabled ? 'ON' : 'OFF'}. Polish: ${polishOn ? 'ON' : 'OFF'}. Engine: ${eng}. Commands: ${cmds}.`);
+        else if (a === 'auto' && (b === 'on' || b === 'off')) { autoOn = b === 'on'; await save(); }
+        else if (a === 'engine' && b === 'local') return ctx.reply('_The local engine (Phonon + local LLM) has been removed. Gemini is the only engine._');
+        else if (a === 'engine' && b === 'gemini') { enginePref = 'gemini'; await save(); }
+        else if (a && a !== 'status') return ctx.reply('_Usage: Lohra --voice on|off, Lohra --voice polish on|off, Lohra --voice commands on|off, Lohra --voice auto on|off, Lohra --voice status_');
+        const eng = !geminiKey() ? 'gemini (NO API KEY: voice notes cannot be transcribed)' : `gemini (${breaker.status()})`;
+        const cmds = !commandsOn ? 'OFF' : enginePref !== 'gemini' ? 'ON but needs the gemini engine' : `ON (${autoOn ? 'the AI decides; ' : 'explicit only; '}end a note with "this is a command" to force it, "this is not a command" to force a transcript)`;
+        return ctx.reply(`*Voice transcription:* ${enabled ? 'ON' : 'OFF'}\\n*Polish:* ${polishOn ? 'ON' : 'OFF'}\\n*Engine:* ${eng}\\n*Commands:* ${cmds}`);
       },
     },
   },

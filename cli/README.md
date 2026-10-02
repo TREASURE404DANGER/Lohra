@@ -8,7 +8,9 @@ Agents only PROPOSE. Sending needs the owner's reaction on WhatsApp: 👍 send n
     wabctl tools            # function declarations, paste into the Live session setup
     wabctl prompt           # recommended system-prompt rules
     wabctl call <tool> '{json}'   # run a tool call, always prints JSON
-Tools: send_message, draft_message, check_action, wait_for_action, cancel_action, list_pending, find_contact, list_contacts, notify_owner, bot_status.
+Tools: send_message, draft_message, check_action, wait_for_action, cancel_action, list_pending, find_contact, list_contacts, notify_owner, bot_status, get_contact_status (one-time look), watch_contact (ongoing, event-driven), list_watches, cancel_watch, find_messages (look back in saved chats), deliver_to_owner.
+Look back: `wabctl messages find --contact Precious --kind voice [--send]`, `wabctl messages send ID`. Only messages the bot saw (30 days) exist.
+Loose wording: periodically/keep/whenever/let me know = watch_contact; check/get/show = get_contact_status. Reminders and timers are not supported.
 Run the agent with `WABCTL_ROLE=agent` to lock out contact editing, logs and doctor.
 
 ## Direct use
@@ -26,4 +28,6 @@ Exit codes: 0 ok/approved, 2 usage, 3 bot unreachable, 4 rejected, 10 declined, 
 - agent/state.json, agent/audit.jsonl: pending requests (survive restarts) and the full history.
 
 ## WhatsApp side (owner only)
-`Lohra agent` (status), `agent yes|draft|no [id]`, `agent pause|resume` (kill switch: cancels everything waiting and refuses new requests).
+`Lohra --agent` (status), `--agent yes|draft|no [id]`, `--agent pause|resume` (kill switch: cancels everything waiting and refuses new requests).
+
+Manual inside WhatsApp: `Lohra --guide` (simple), `Lohra --guide dev` (technical).

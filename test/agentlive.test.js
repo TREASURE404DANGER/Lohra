@@ -2,9 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
-
-const live = await import(fileURLToPath(new URL('../plugins/_agentlive.js', import.meta.url)));
-const tools = await import(fileURLToPath(new URL('../plugins/_agenttools.js', import.meta.url)));
+const live = await import('../plugins/_agentlive.js');
+const tools = await import('../plugins/_agenttools.js');
 const KEY = 'AQ.TestKey1234567890abcdef';
 
 function fakeWS(handler) {
@@ -113,7 +112,7 @@ test('tool declarations and rules mention the new reactions only', () => {
   for (const e of ['👎', '✍']) assert.ok(!all.includes(e), `${e} is gone`);
   assert.ok(!tools.TOOL_DECLS.some((t) => t.name === 'wait_for_action'));
   assert.ok(!tools.TOOL_DECLS.some((t) => /approve/i.test(t.name)));           // the agent has no way to approve
-  assert.deepEqual(tools.TOOL_DECLS.map((t) => t.name).sort(), ['bot_status', 'cancel_action', 'check_action', 'draft_message', 'find_contact', 'get_contact_status', 'list_contacts', 'list_pending', 'notify_owner', 'send_message']);
+  assert.deepEqual(tools.TOOL_DECLS.map((t) => t.name).sort(), ['bot_status', 'cancel_action', 'cancel_watch', 'check_action', 'deliver_to_owner', 'draft_message', 'find_contact', 'find_messages', 'get_contact_status', 'list_contacts', 'list_pending', 'list_watches', 'notify_owner', 'send_bulk', 'send_message', 'watch_contact']);
 });
 
 test('makeDispatch: maps each tool to the Agent operation, drops non-string arguments, rejects unknown tools', async () => {
