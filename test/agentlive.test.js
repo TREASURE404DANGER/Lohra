@@ -111,8 +111,14 @@ test('tool declarations and rules mention the new reactions only', () => {
   for (const e of ['👍', '🙏', '😢']) assert.ok(all.includes(e), e);
   for (const e of ['👎', '✍']) assert.ok(!all.includes(e), `${e} is gone`);
   assert.ok(!tools.TOOL_DECLS.some((t) => t.name === 'wait_for_action'));
-  assert.ok(!tools.TOOL_DECLS.some((t) => /approve/i.test(t.name)));           // the agent has no way to approve
-  assert.deepEqual(tools.TOOL_DECLS.map((t) => t.name).sort(), ['bot_status', 'cancel_action', 'cancel_watch', 'check_action', 'deliver_to_owner', 'draft_message', 'find_contact', 'find_messages', 'get_contact_status', 'list_contacts', 'list_pending', 'list_watches', 'notify_owner', 'send_bulk', 'send_message', 'watch_contact']);
+  assert.deepEqual(tools.TOOL_DECLS.map((t) => t.name).sort(), [
+    'bot_status', 'cancel_action', 'cancel_watch', 'check_action', 'check_on_whatsapp',
+    'deliver_to_owner', 'draft_message', 'find_contact', 'find_messages', 'get_contact_status',
+    'group_info', 'inspect_manual', 'list_chats', 'list_contacts', 'list_groups',
+    'list_pending', 'list_watches', 'notify_owner', 'propose_chat_action', 'propose_contact_action',
+    'propose_group_action', 'propose_message_action', 'propose_profile_action', 'propose_status_post',
+    'send_bulk', 'send_message', 'watch_contact',
+  ]);
 });
 
 test('makeDispatch: maps each tool to the Agent operation, drops non-string arguments, rejects unknown tools', async () => {

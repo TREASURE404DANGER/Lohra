@@ -166,6 +166,72 @@ TOOLS = {
         desc="List the owner's active watches (who, what, how long left) and the last few finished ones.", props={}, req=[], run=lambda a: rpc("watch.list")),
     "cancel_watch": dict(
         desc="Stop a watch so it no longer reports new items. Use for 'stop watching X', 'cancel that', 'forget it'; pass the id, the contact name, or 'all'.", props={"id": ("string", "The watch id from watch_contact or list_watches, a contact name, or 'all'.")}, req=["id"], run=lambda a: rpc("watch.cancel", id=a["id"])),
+    "group_info": dict(
+        desc="Fetch metadata for a WhatsApp group: subject, description, admin list, and member count. Use to check group details or admin status before proposing actions.",
+        props={"group": ("string", "Group name or group JID (e.g. '120363...@g.us').")},
+        req=["group"], run=lambda a: rpc("groups.info", group=a["group"])),
+    "list_groups": dict(
+        desc="List all WhatsApp groups the bot is currently participating in, with their names and member counts.",
+        props={}, req=[], run=lambda a: rpc("groups.list")),
+    "list_chats": dict(
+        desc="List recent active WhatsApp chats and unread message counts from the bot's session.",
+        props={"limit": ("integer", "Maximum number of chats to list (1-50, default 10).")},
+        req=[], run=lambda a: rpc("chats.list", limit=a.get("limit", 10))),
+    "check_on_whatsapp": dict(
+        desc="Check if a phone number is registered on WhatsApp before proposing to message or add them.",
+        props={"number": ("string", "The phone number with country code to check.")},
+        req=["number"], run=lambda a: rpc("contacts.check", number=a["number"])),
+    "inspect_manual": dict(
+        desc="Query documentation on Lohra CLI capabilities, commands, and options when brainstorming how to fulfill a complex request.",
+        props={"topic": ("string", "Topic to inspect: 'groups', 'messages', 'chats', 'contacts', 'status', 'profile', 'watches', or 'all'.")},
+        req=[], run=lambda a: rpc("manual.inspect", topic=a.get("topic", "all"))),
+    "propose_group_action": dict(
+        desc=("Propose an action on a WhatsApp group: kick, add, promote, demote, subject, description, setting, revoke_invite, or tagall. "
+              "Nothing happens immediately: the owner receives an Approval Card in their chat and must react thumbs up to execute, pencil for details, or thumbs down to decline."),
+        props={"action": ("string", "The group action: kick, add, promote, demote, subject, description, setting, revoke_invite, or tagall."),
+               "group": ("string", "Group name or JID."),
+               "member": ("string", "Contact name or phone number of the target member (for kick, add, promote, demote)."),
+               "text": ("string", "New text for subject, description, or tagall message."),
+               "setting": ("string", "Setting to update: announcement, not_announcement, locked, unlocked.")},
+        req=["action", "group"], run=lambda a: rpc("propose.group", action=a["action"], group=a["group"], member=a.get("member"), text=a.get("text"), setting=a.get("setting"), source="wabctl")),
+    "propose_message_action": dict(
+        desc=("Propose an action on a message: edit a sent message, delete for everyone, pin, react with emoji, create a group poll, or star/unstar. "
+              "Nothing happens immediately: the owner receives an Approval Card in their chat and must react thumbs up to execute, pencil for details, or thumbs down to decline."),
+        props={"action": ("string", "The message action: edit, delete, pin, react, poll, star."),
+               "chat": ("string", "Contact name, phone number, or group JID where the message is."),
+               "message_id": ("string", "The message ID from find_messages or recent chat."),
+               "text": ("string", "New text (for edit), emoji (for react), or poll question (for poll)."),
+               "options": ("array", "Options for poll (at least 2)."),
+               "duration_hours": ("integer", "Duration in hours for pin (e.g. 24, 168). 0 to unpin.")},
+        req=["action", "chat"], run=lambda a: rpc("propose.message", action=a["action"], chat=a["chat"], message_id=a.get("message_id"), text=a.get("text"), options=a.get("options"), duration_hours=a.get("duration_hours"), source="wabctl")),
+    "propose_chat_action": dict(
+        desc=("Propose an action on a chat: mute notifications, unmute, archive, unarchive, or clear messages. "
+              "Nothing happens immediately: the owner receives an Approval Card in their chat and must react thumbs up to execute, pencil for details, or thumbs down to decline."),
+        props={"action": ("string", "The chat action: mute, unmute, archive, unarchive, clear."),
+               "chat": ("string", "Contact name, phone number, or group JID."),
+               "duration_hours": ("integer", "Mute duration in hours (8, 24, 168, or 0 for permanent). Default 8.")},
+        req=["action", "chat"], run=lambda a: rpc("propose.chat", action=a["action"], chat=a["chat"], duration_hours=a.get("duration_hours"), source="wabctl")),
+    "propose_contact_action": dict(
+        desc=("Propose a contact management action: block a contact, unblock, add to address book, or remove. "
+              "Nothing happens immediately: the owner receives an Approval Card in their chat and must react thumbs up to execute, pencil for details, or thumbs down to decline."),
+        props={"action": ("string", "The contact action: block, unblock, add, remove."),
+               "contact": ("string", "Contact name or phone number."),
+               "number": ("string", "Phone number for add action."),
+               "alias": ("string", "Optional alias for add action."),
+               "note": ("string", "Optional note for add action.")},
+        req=["action", "contact"], run=lambda a: rpc("propose.contact", action=a["action"], contact=a["contact"], number=a.get("number"), alias=a.get("alias"), note=a.get("note"), source="wabctl")),
+    "propose_status_post": dict(
+        desc=("Propose posting a status story to WhatsApp with optional background color. "
+              "Nothing is posted immediately: the owner receives an Approval Card in their chat and must react thumbs up to post, pencil for draft, or thumbs down to decline."),
+        props={"text": ("string", "The text content to post to WhatsApp status story."),
+               "background_color": ("string", "Hex color code (e.g. #128C7E, #075E54).")},
+        req=["text"], run=lambda a: rpc("propose.status", text=a["text"], background_color=a.get("background_color"), source="wabctl")),
+    "propose_profile_action": dict(
+        desc=("Propose updating the owner's WhatsApp profile bio (About text) or display name. "
+              "Nothing is changed immediately: the owner receives an Approval Card in their chat and must react thumbs up to update, pencil for details, or thumbs down to decline."),
+        props={"action": ("string", "Whether to update bio (About) or display name (name)."),
+               "text": ("string", "The new bio text (max 139 chars) or display name (max 25 chars).")},
+        req=["action", "text"], run=lambda a: rpc("propose.profile", action=a["action"], text=a["text"], source="wabctl")),
 }
 
 PROMPT = """You can act on the owner's WhatsApp through tools. The tools are the complete list of what you can do; you cannot do anything else.
@@ -457,6 +523,18 @@ def main(argv=None):
     s.add_argument("sub", choices=["find", "send"]); s.add_argument("target", nargs="?", help="send: the message id")
     s.add_argument("--contact"); s.add_argument("--kind", choices=["any", "text", "voice", "image", "video", "document", "sticker"]); s.add_argument("--from", dest="sender", choices=["any", "them", "me"])
     s.add_argument("--query"); s.add_argument("--limit", type=int); s.add_argument("--hours", type=int); s.add_argument("--send", action="store_true", help="also send the newest match to the owner's own chat")
+    s = add("groups", help="list | info | kick | add | promote | demote | subject | desc | setting | invite | tagall")
+    s.add_argument("sub", choices=["list", "info", "kick", "add", "promote", "demote", "subject", "desc", "setting", "invite", "tagall"])
+    s.add_argument("--group"); s.add_argument("--member"); s.add_argument("--text"); s.add_argument("--subject"); s.add_argument("--setting")
+    s = add("chats", help="list | mute | unmute | archive | clear")
+    s.add_argument("sub", choices=["list", "mute", "unmute", "archive", "clear"])
+    s.add_argument("--chat"); s.add_argument("--hours", type=int, default=8); s.add_argument("--limit", type=int, default=10)
+    s = add("profile", help="bio | name")
+    s.add_argument("sub", choices=["bio", "name"])
+    s.add_argument("--text"); s.add_argument("--name")
+    s = add("status", help="list | get | post")
+    s.add_argument("sub", choices=["list", "get", "post"])
+    s.add_argument("--contact"); s.add_argument("--text"); s.add_argument("--color")
     s = add("guide", help="operating guide for agents: which command/tool to use for which request"); 
     s = add("tools", help="tool declarations for an agent (Gemini function-calling format)"); s.add_argument("--plain", action="store_true", help="plain list instead of {functionDeclarations: [...]}")
     add("prompt", help="recommended system-prompt rules for the agent")
@@ -498,6 +576,78 @@ def main(argv=None):
                 if not a.contact or not a.kind:
                     return emit({"ok": False, "error": "usage", "message": "watch add needs --contact NAME and --kind status|message"}, 2, as_json)
                 res = t_watch({"contact": a.contact, "kind": a.kind, "condition": a.condition, "keep_watching": bool(a.keep), "hours": a.hours})
+            return emit(res, code_for(res), as_json)
+        if a.cmd == "groups":
+            if a.sub == "list":
+                res = rpc("groups.list")
+            elif a.sub == "info":
+                if not a.group:
+                    return emit({"ok": False, "error": "usage", "message": "groups info needs --group NAME|JID"}, 2, as_json)
+                res = rpc("groups.info", group=a.group)
+            elif a.sub in ("kick", "add", "promote", "demote"):
+                if not a.group or not a.member:
+                    return emit({"ok": False, "error": "usage", "message": f"groups {a.sub} needs --group and --member"}, 2, as_json)
+                res = rpc("propose.group", action=a.sub, group=a.group, member=a.member, source="wabctl")
+            elif a.sub == "subject":
+                sub_text = a.subject or a.text
+                if not a.group or not sub_text:
+                    return emit({"ok": False, "error": "usage", "message": "groups subject needs --group and --subject"}, 2, as_json)
+                res = rpc("propose.group", action="subject", group=a.group, subject=sub_text, source="wabctl")
+            elif a.sub == "desc":
+                if not a.group:
+                    return emit({"ok": False, "error": "usage", "message": "groups desc needs --group and --text"}, 2, as_json)
+                res = rpc("propose.group", action="description", group=a.group, text=a.text or "", source="wabctl")
+            elif a.sub == "setting":
+                if not a.group or not a.setting:
+                    return emit({"ok": False, "error": "usage", "message": "groups setting needs --group and --setting"}, 2, as_json)
+                res = rpc("propose.group", action="setting", group=a.group, setting=a.setting, source="wabctl")
+            elif a.sub == "invite":
+                if not a.group:
+                    return emit({"ok": False, "error": "usage", "message": "groups invite needs --group"}, 2, as_json)
+                res = rpc("groups.invite", group=a.group)
+            elif a.sub == "tagall":
+                if not a.group:
+                    return emit({"ok": False, "error": "usage", "message": "groups tagall needs --group"}, 2, as_json)
+                res = rpc("propose.group", action="tagall", group=a.group, text=a.text or "", source="wabctl")
+            return emit(res, code_for(res), as_json)
+        if a.cmd == "chats":
+            if a.sub == "list":
+                res = rpc("chats.list", limit=a.limit)
+            elif a.sub == "mute":
+                if not a.chat:
+                    return emit({"ok": False, "error": "usage", "message": "chats mute needs --chat"}, 2, as_json)
+                res = rpc("propose.chat", action="mute", chat=a.chat, duration_hours=a.hours, source="wabctl")
+            elif a.sub == "unmute":
+                if not a.chat:
+                    return emit({"ok": False, "error": "usage", "message": "chats unmute needs --chat"}, 2, as_json)
+                res = rpc("propose.chat", action="unmute", chat=a.chat, source="wabctl")
+            elif a.sub in ("archive", "clear"):
+                if not a.chat:
+                    return emit({"ok": False, "error": "usage", "message": f"chats {a.sub} needs --chat"}, 2, as_json)
+                res = rpc("propose.chat", action=a.sub, chat=a.chat, source="wabctl")
+            return emit(res, code_for(res), as_json)
+        if a.cmd == "profile":
+            if a.sub == "bio":
+                if not a.text:
+                    return emit({"ok": False, "error": "usage", "message": "profile bio needs --text"}, 2, as_json)
+                res = rpc("propose.profile", action="bio", text=a.text, source="wabctl")
+            elif a.sub == "name":
+                name_text = a.name or a.text
+                if not name_text:
+                    return emit({"ok": False, "error": "usage", "message": "profile name needs --name"}, 2, as_json)
+                res = rpc("propose.profile", action="name", text=name_text, source="wabctl")
+            return emit(res, code_for(res), as_json)
+        if a.cmd == "status":
+            if a.sub == "list":
+                res = rpc("status.list")
+            elif a.sub == "get":
+                if not a.contact:
+                    return emit({"ok": False, "error": "usage", "message": "status get needs --contact"}, 2, as_json)
+                res = rpc("status.get", contact=a.contact)
+            elif a.sub == "post":
+                if not a.text:
+                    return emit({"ok": False, "error": "usage", "message": "status post needs --text"}, 2, as_json)
+                res = rpc("propose.status", text=a.text, background_color=a.color or "#128C7E", source="wabctl")
             return emit(res, code_for(res), as_json)
         if a.cmd == "tools":
             d = gemini_decls()

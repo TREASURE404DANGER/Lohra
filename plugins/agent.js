@@ -15,6 +15,7 @@ import { parseRequest, cleanText as cleanJudgeText } from './_judge.js';
 import { TOOL_DECLS, SYSTEM_PROMPT, makeDispatch, commandReply, STATE_TOOLS } from './_agenttools.js';
 import { BULK, planRecipients, bulkPrompt, personalize, pickDelaySec, gapMs, humanDuration, estimateSec, finalNote, counts, toList } from './_bulk.js';
 import { loadContacts, resolveRecipient, display, mask, classifyEmoji, classifyWord, parseContactInput, saveContact, deleteContact } from './_contacts.js';
+import * as ops from './_baileys_ops.js';
 
 const DEFAULTS = {
   ttlSec: 600, minTtlSec: 30, maxTtlSec: 3600, // how long an approval request stays open
@@ -24,7 +25,7 @@ const DEFAULTS = {
   verifyNumbers: true,        // check the number is on WhatsApp before asking you
   bulkDelaySec: BULK.delaySec, bulkJitter: BULK.jitter, maxBulk: BULK.maxRecipients, maxBulkPerDay: BULK.maxPerDay, bulkFailStreak: BULK.failStreak, // broadcasts
 };
-const FINAL = new Set(['sent', 'drafted', 'declined', 'expired', 'cancelled', 'failed']);
+const FINAL = new Set(['sent', 'drafted', 'declined', 'expired', 'cancelled', 'failed', 'executed']);
 const ID_CHARS = 'abcdefghjkmnpqrstuvwxyz23456789';
 const CTRL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const err = (error, message, extra = {}) => ({ ok: false, error, message, ...extra });
@@ -167,6 +168,21 @@ export class Agent {
         case 'send': return await this.#propose('send', req);
         case 'draft': return await this.#propose('draft', req);
         case 'send.bulk': return await this.#proposeBulk(req);
+        case 'propose.action': return await this.proposeAction(req);
+        case 'propose.group': return await this.#proposeGroup(req);
+        case 'propose.message': return await this.#proposeMessage(req);
+        case 'propose.chat': return await this.#proposeChat(req);
+        case 'propose.contact': return await this.#proposeContact(req);
+        case 'propose.status': return await this.#proposeStatus(req);
+        case 'propose.profile': return await this.#proposeProfile(req);
+        case 'groups.info': return await this.#groupInfo(req);
+        case 'groups.list': return await this.#groupList();
+        case 'groups.invite': return await this.#groupInvite(req);
+        case 'groups.requests': return await this.#groupRequests(req);
+        case 'chats.list': return await this.#chatsList(req);
+        case 'contacts.check': return await this.#contactsCheck(req);
+        case 'contacts.blocklist': return await this.#contactsBlocklist();
+        case 'manual.inspect': return this.#manualInspect(req);
         case 'stop': return await this.stopBulk(req.id);
         case 'notify': return await this.#notify(req.text);
         case 'get': return this.#get(req.id);
@@ -319,11 +335,25 @@ export class Agent {
   #isOwner(m) { return !!m.key?.fromMe || [m.key?.participant, m.key?.remoteJid].map(digitsOf).some((d) => d && this.api.config.allowed?.includes(d)); }
   #pending() { return [...this.actions.values()].filter((a) => a.status === 'pending'); }
   #view(a) {
+    const isToObj = a.to && typeof a.to === 'object';
+    const toName = isToObj ? (a.to.name ?? a.to.display) : (a.targetDesc || a.to || 'Self');
     return {
-      id: a.id, type: a.type, status: a.status, to: a.to.name ?? a.to.display, recipient_hint: a.to.hint, text: a.text,
-      created_at: new Date(a.createdAt).toISOString(), expires_at: a.type === 'send' ? new Date(a.expiresAt).toISOString() : undefined,
-      decided_via: a.via, error: a.error,
-      ...(a.type === 'bulk' ? { recipients: a.recips.length, ...counts(a), delay_sec: a.delaySec, skipped_people: a.skipped } : {}),
+      id: a.id,
+      type: a.type,
+      action_type: a.actionType,
+      status: a.status,
+      title: a.title,
+      target: a.targetDesc || toName,
+      details: a.details || a.text,
+      to: toName,
+      recipient_hint: isToObj ? a.to.hint : undefined,
+      text: a.text || a.details,
+      created_at: new Date(a.createdAt).toISOString(),
+      expires_at: a.expiresAt ? new Date(a.expiresAt).toISOString() : undefined,
+      decided_via: a.via,
+      error: a.error,
+      result: a.result,
+      ...(a.type === 'bulk' ? { recipients: a.recips?.length, ...counts(a), delay_sec: a.delaySec, skipped_people: a.skipped } : {}),
     };
   }
   #newId() { let id; do { id = Array.from({ length: 4 }, () => ID_CHARS[crypto.randomInt(ID_CHARS.length)]).join(''); } while (this.actions.has(id)); return id; }
@@ -599,6 +629,365 @@ export class Agent {
     await this.api.send(a.selfJid, { text: a.text });
   }
 
+  #promptGeneric(a, ttl) {
+    return [
+      `*Action Proposal (#${a.id})*`,
+      `*Action:* ${a.title || a.actionType || a.type}`,
+      `*Target:* ${a.targetDesc || 'WhatsApp'}`,
+      `*Details:* ${a.details || 'None'}`,
+      '',
+      '👍 Approve & execute   🙏 Details / draft   😢 Decline & cancel',
+      `#${a.id} · expires in ${human(ttl)}`,
+    ].join('\n');
+  }
+
+  async proposeAction({ type, title, targetDesc, details, payload, ttlSec, source }) {
+    if (this.paused) return err('paused', 'The owner has paused agent actions.', { hint: 'Tell the owner; they can resume with "Lohra agent resume".' });
+    const self = this.#self();
+    if (!self) return err('bot_offline', 'The WhatsApp bot is not connected right now.', { retryable: true });
+
+    if (this.#pending().length >= this.cfg.maxPending) {
+      return err('too_many_pending', 'Too many requests are waiting for the owner.', { hint: 'Wait for the owner to answer the pending ones first.' });
+    }
+    const hourAgo = this.now() - 3600_000;
+    this.stamps = this.stamps.filter((t) => t > hourAgo);
+    if (this.stamps.length >= this.cfg.maxPerHour) return err('rate_limited', 'Too many requests in the last hour.', { retryable: true });
+    this.stamps.push(this.now());
+
+    const ttl = Math.min(this.cfg.maxTtlSec, Math.max(this.cfg.minTtlSec, Number(ttlSec) || this.cfg.ttlSec));
+    const a = {
+      id: this.#newId(),
+      type: 'action',
+      actionType: type,
+      status: 'pending',
+      title: String(title || type),
+      targetDesc: String(targetDesc || 'WhatsApp'),
+      details: String(details || ''),
+      payload: payload || {},
+      selfJid: self,
+      createdAt: this.now(),
+      expiresAt: this.now() + ttl * 1000,
+      source: String(source || '').slice(0, 40),
+    };
+    this.actions.set(a.id, a);
+    await this.#audit('proposed_action', a, { actionType: type, targetDesc, details, source: a.source });
+
+    try {
+      a.prompt = this.#promptGeneric(a, ttl);
+      const res = await this.api.send(self, { text: a.prompt });
+      a.msgId = res?.key?.id;
+      if (!a.msgId) throw new Error('no message id returned');
+      this.byMsg.set(a.msgId, a.id);
+    } catch (e) {
+      this.actions.delete(a.id);
+      await this.#audit('failed', a, { error: e.message });
+      return err('send_failed', `Could not reach the owner's WhatsApp: ${e.message}`, { retryable: true });
+    }
+    await this.#save();
+    this.log.info({ id: a.id, actionType: type, target: targetDesc }, 'agent: action proposal requested');
+    return {
+      ok: true,
+      ...this.#view(a),
+      message: 'Waiting for the owner to approve on WhatsApp (nothing has been executed yet). Tell them to check their phone and react 👍 to approve.',
+    };
+  }
+
+  async #executeBaileysAction(sock, a) {
+    const p = a.payload || {};
+    switch (a.actionType) {
+      case 'groups.kick':
+        return await ops.groupParticipantsUpdate(sock, p.group, p.member, 'remove');
+      case 'groups.add':
+        return await ops.groupParticipantsUpdate(sock, p.group, p.member, 'add');
+      case 'groups.promote':
+        return await ops.groupParticipantsUpdate(sock, p.group, p.member, 'promote');
+      case 'groups.demote':
+        return await ops.groupParticipantsUpdate(sock, p.group, p.member, 'demote');
+      case 'groups.subject':
+        return await ops.groupUpdateSubject(sock, p.group, p.subject || p.text);
+      case 'groups.description':
+        return await ops.groupUpdateDescription(sock, p.group, p.description || p.text);
+      case 'groups.setting':
+        return await ops.groupSettingUpdate(sock, p.group, p.setting);
+      case 'groups.revoke_invite':
+      case 'groups.revoke':
+        return await ops.groupInvite(sock, p.group, 'revoke');
+      case 'groups.tagall':
+        return await ops.groupTagAll(sock, p.group, p.text);
+      case 'groups.requests':
+        return await ops.groupRequests(sock, p.group, p.action || 'list', p.participants);
+      case 'msgs.edit':
+        return await ops.messageEdit(sock, p.chat, p.key || p.message_id, p.newText || p.text);
+      case 'msgs.delete':
+        return await ops.messageDelete(sock, p.chat, p.key || p.message_id);
+      case 'msgs.pin':
+        return await ops.messagePin(sock, p.chat, p.key || p.message_id, p.duration_hours || p.durationHours);
+      case 'msgs.react':
+        return await ops.messageReact(sock, p.chat, p.key || p.message_id, p.emoji || p.text);
+      case 'msgs.poll':
+        return await ops.messagePoll(sock, p.chat, p.question || p.text, p.options, p.selectableCount);
+      case 'msgs.star':
+        return await ops.messageStar(sock, p.chat, p.key || p.message_id, p.star !== false);
+      case 'chats.mute':
+        return await ops.chatMute(sock, p.chat, p.duration_hours || p.durationHours);
+      case 'chats.unmute':
+        return await ops.chatUnmute(sock, p.chat);
+      case 'chats.archive':
+        return await ops.chatArchive(sock, p.chat, p.archive !== false);
+      case 'chats.clear':
+        return await ops.chatClear(sock, p.chat);
+      case 'contacts.block':
+        return await ops.contactBlock(sock, p.contact, 'block');
+      case 'contacts.unblock':
+        return await ops.contactBlock(sock, p.contact, 'unblock');
+      case 'contacts.add':
+        return await this.addContact(p);
+      case 'contacts.remove':
+        return await this.removeContact(p.name || p.contact);
+      case 'profile.bio':
+        return await ops.profileUpdateBio(sock, p.text);
+      case 'profile.name':
+        return await ops.profileUpdateName(sock, p.text || p.name);
+      case 'status.post':
+        return await ops.statusPost(sock, { text: p.text, backgroundColor: p.background_color || p.backgroundColor, font: p.font });
+      default:
+        return { ok: false, error: 'unknown_action_type', message: `Unknown action type ${a.actionType}` };
+    }
+  }
+
+  async #proposeGroup(req) {
+    const act = String(req?.action || '').toLowerCase().trim();
+    const valid = ['kick', 'add', 'promote', 'demote', 'subject', 'description', 'setting', 'revoke_invite', 'tagall'];
+    if (!valid.includes(act)) return err('invalid_action', `Group action must be one of: ${valid.join(', ')}.`);
+    const group = String(req?.group || '').trim();
+    if (!group) return err('invalid_group', 'Specify the target group name or JID.');
+    let details = act;
+    if (['kick', 'add', 'promote', 'demote'].includes(act)) {
+      if (!req.member) return err('invalid_member', `Specify which member to ${act}.`);
+      details = `${act} ${req.member}`;
+    } else if (act === 'subject') {
+      if (!req.text && !req.subject) return err('invalid_subject', 'Specify the new group subject/title.');
+      details = `Change subject to "${req.text || req.subject}"`;
+    } else if (act === 'description') {
+      details = `Change description to "${req.text || req.description || ''}"`;
+    } else if (act === 'setting') {
+      if (!req.setting) return err('invalid_setting', 'Specify setting (announcement, not_announcement, locked, unlocked).');
+      details = `Set setting: ${req.setting}`;
+    } else if (act === 'tagall') {
+      details = `Tag all members${req.text ? `: "${req.text}"` : ''}`;
+    } else if (act === 'revoke_invite') {
+      details = 'Revoke invite link and generate a new code';
+    }
+    return await this.proposeAction({
+      type: `groups.${act}`,
+      title: `Group ${act.toUpperCase()}`,
+      targetDesc: group,
+      details,
+      payload: req,
+      ttlSec: req.ttl,
+      source: req.source,
+    });
+  }
+
+  async #proposeMessage(req) {
+    const act = String(req?.action || '').toLowerCase().trim();
+    const valid = ['edit', 'delete', 'pin', 'react', 'poll', 'star'];
+    if (!valid.includes(act)) return err('invalid_action', `Message action must be one of: ${valid.join(', ')}.`);
+    const chat = String(req?.chat || '').trim();
+    if (!chat) return err('invalid_chat', 'Specify the chat/contact for the message.');
+    let details = act;
+    if (act === 'edit') {
+      if (!req.text) return err('invalid_text', 'Specify the new text for the message.');
+      details = `Edit message ${req.message_id || req.key || ''} to: "${req.text}"`;
+    } else if (act === 'delete') {
+      details = `Delete message ${req.message_id || req.key || ''} for everyone`;
+    } else if (act === 'pin') {
+      const h = Number(req.duration_hours) || 24;
+      details = `Pin message ${req.message_id || req.key || ''} for ${h}h`;
+    } else if (act === 'react') {
+      if (!req.text && !req.emoji) return err('invalid_emoji', 'Specify the emoji to react with.');
+      details = `React with ${req.text || req.emoji} to message ${req.message_id || req.key || ''}`;
+    } else if (act === 'poll') {
+      if (!req.text && !req.question) return err('invalid_question', 'Specify the poll question.');
+      const opts = req.options || [];
+      details = `Create poll "${req.text || req.question}" with ${opts.length} option(s)`;
+    } else if (act === 'star') {
+      details = `Star message ${req.message_id || req.key || ''}`;
+    }
+    return await this.proposeAction({
+      type: `msgs.${act}`,
+      title: `Message ${act.toUpperCase()}`,
+      targetDesc: chat,
+      details,
+      payload: req,
+      ttlSec: req.ttl,
+      source: req.source,
+    });
+  }
+
+  async #proposeChat(req) {
+    const act = String(req?.action || '').toLowerCase().trim();
+    const valid = ['mute', 'unmute', 'archive', 'unarchive', 'clear'];
+    if (!valid.includes(act)) return err('invalid_action', `Chat action must be one of: ${valid.join(', ')}.`);
+    const chat = String(req?.chat || '').trim();
+    if (!chat) return err('invalid_chat', 'Specify the chat to modify.');
+    let details = act;
+    if (act === 'mute') {
+      const h = Number(req.duration_hours) || 8;
+      details = `Mute notifications for ${h} hours`;
+    } else if (act === 'unmute') {
+      details = 'Unmute notifications';
+    } else if (act === 'archive') {
+      details = 'Archive chat';
+    } else if (act === 'unarchive') {
+      details = 'Unarchive chat';
+    } else if (act === 'clear') {
+      details = 'Clear chat history';
+    }
+    return await this.proposeAction({
+      type: `chats.${act}`,
+      title: `Chat ${act.toUpperCase()}`,
+      targetDesc: chat,
+      details,
+      payload: req,
+      ttlSec: req.ttl,
+      source: req.source,
+    });
+  }
+
+  async #proposeContact(req) {
+    const act = String(req?.action || '').toLowerCase().trim();
+    const valid = ['block', 'unblock', 'add', 'remove'];
+    if (!valid.includes(act)) return err('invalid_action', `Contact action must be one of: ${valid.join(', ')}.`);
+    const contact = String(req?.contact || req?.name || '').trim();
+    if (!contact) return err('invalid_contact', 'Specify the contact name or number.');
+    let details = `${act} ${contact}`;
+    if (act === 'add') {
+      if (!req.number) return err('invalid_number', 'Phone number is required to save contact.');
+      details = `Save contact "${contact}" (${req.number})${req.alias ? ` alias: ${req.alias}` : ''}`;
+    }
+    return await this.proposeAction({
+      type: `contacts.${act}`,
+      title: `Contact ${act.toUpperCase()}`,
+      targetDesc: contact,
+      details,
+      payload: req,
+      ttlSec: req.ttl,
+      source: req.source,
+    });
+  }
+
+  async #proposeStatus(req) {
+    const text = String(req?.text || '').trim();
+    if (!text) return err('invalid_text', 'Status text cannot be empty.');
+    return await this.proposeAction({
+      type: 'status.post',
+      title: 'WhatsApp Status Post',
+      targetDesc: 'My Status Story',
+      details: text,
+      payload: req,
+      ttlSec: req.ttl,
+      source: req.source,
+    });
+  }
+
+  async #proposeProfile(req) {
+    const act = String(req?.action || 'bio').toLowerCase().trim();
+    if (!['bio', 'name'].includes(act)) return err('invalid_action', 'Profile action must be bio or name.');
+    const text = String(req?.text || req?.name || '').trim();
+    if (!text) return err('invalid_text', `Profile ${act} text cannot be empty.`);
+    return await this.proposeAction({
+      type: `profile.${act}`,
+      title: `Profile ${act.toUpperCase()}`,
+      targetDesc: 'My Profile',
+      details: `Set ${act} to "${text}"`,
+      payload: req,
+      ttlSec: req.ttl,
+      source: req.source,
+    });
+  }
+
+  async #groupInfo(req) {
+    try {
+      const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+      return await ops.groupInfo(sock, req?.group);
+    } catch (e) {
+      return err('bot_offline', `Could not fetch group info: ${e.message}`, { retryable: true });
+    }
+  }
+
+  async #groupList() {
+    try {
+      const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+      return await ops.groupList(sock);
+    } catch (e) {
+      return err('bot_offline', `Could not list groups: ${e.message}`, { retryable: true });
+    }
+  }
+
+  async #groupInvite(req) {
+    try {
+      const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+      return await ops.groupInvite(sock, req?.group, req?.action || 'code');
+    } catch (e) {
+      return err('bot_offline', `Could not fetch invite: ${e.message}`, { retryable: true });
+    }
+  }
+
+  async #groupRequests(req) {
+    try {
+      const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+      return await ops.groupRequests(sock, req?.group, req?.action || 'list', req?.participants);
+    } catch (e) {
+      return err('bot_offline', `Could not manage group requests: ${e.message}`, { retryable: true });
+    }
+  }
+
+  async #chatsList(req) {
+    const limit = Number(req?.limit) || 10;
+    const store = this.api.store;
+    const chats = store?.chats ? Object.values(store.chats).slice(0, limit) : [];
+    return { ok: true, count: chats.length, chats };
+  }
+
+  async #contactsCheck(req) {
+    try {
+      const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+      return await ops.checkOnWhatsApp(sock, req?.number);
+    } catch (e) {
+      return err('bot_offline', `Could not check number: ${e.message}`, { retryable: true });
+    }
+  }
+
+  async #contactsBlocklist() {
+    try {
+      const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+      return await ops.fetchBlocklist(sock);
+    } catch (e) {
+      return err('bot_offline', `Could not fetch blocklist: ${e.message}`, { retryable: true });
+    }
+  }
+
+  #manualInspect(req) {
+    const topic = String(req?.topic || 'all').toLowerCase();
+    const docs = {
+      groups: 'groups: info, list, kick, add, promote, demote, subject, description, setting, invite, revoke, tagall, requests. State-changing actions are proposed and require owner verification (👍).',
+      messages: 'messages: send, bulk, draft, edit, delete, pin, react, poll, star. Mutating operations are proposed and require owner verification (👍).',
+      chats: 'chats: list, mute (8h, 24h, 168h), unmute, archive, unarchive, clear. Mutating operations require owner verification (👍).',
+      contacts: 'contacts: list, find, add, remove, block, unblock, check, blocklist. Blocking and adding/removing require owner verification (👍).',
+      status: 'status: get (one-time status download), list, post (post text status story with color). Status post requires owner verification (👍).',
+      profile: 'profile: bio (About text up to 139 chars), name (display name up to 25 chars). Requires owner verification (👍).',
+      watches: 'watches: add (ongoing monitor for status or message updates), list, cancel. Event-driven.',
+    };
+    if (topic in docs) return { ok: true, topic, doc: docs[topic] };
+    return {
+      ok: true,
+      topic: 'all',
+      sections: docs,
+      rule: 'All state-changing actions are proposed to the owner WhatsApp chat as an Approval Card. The owner must react 👍 to execute, 🙏 for draft/details, or 😢 to decline. Never claim an action has been taken before owner reaction verification.',
+    };
+  }
+
   async #notify(text) {
     const t = typeof text === 'string' ? text.trim().slice(0, 1000) : '';
     if (!t) return err('invalid_text', 'The note is empty.');
@@ -632,7 +1021,7 @@ export class Agent {
     a.status = 'cancelled'; a.decidedAt = this.now(); a.via = via;
     await this.#save();
     await this.#audit('cancelled', a, { via });
-    await this.#note(a, `_Cancelled (#${a.id}). Nothing was sent._`);
+    await this.#note(a, a.type === 'action' ? `_Cancelled (#${a.id}). Nothing was changed._` : `_Cancelled (#${a.id}). Nothing was sent._`);
     return { ok: true, ...this.#view(a) };
   }
 
@@ -643,22 +1032,48 @@ export class Agent {
     if (a.status !== 'pending') return err('not_pending', `That request is already ${a.status}.`, { status: a.status });
     if (a.expiresAt <= this.now()) { await this.#expire(a); return err('expired', 'That request expired.'); }
     a.decidedAt = this.now(); a.via = via;
-    const name = a.to.name ?? a.to.display;
+    const name = a.to ? (a.to.name ?? a.to.display) : (a.targetDesc || 'Self');
+
     if (decision === 'decline') {
       a.status = 'declined';
       await this.#save(); await this.#audit('declined', a, { via });
-      await this.#note(a, '_Declined. Nothing was sent._');
+      await this.#note(a, a.type === 'action' ? `_Declined (#${a.id}). Nothing was executed._` : '_Declined. Nothing was sent._');
     } else if (decision === 'draft') {
-      a.status = 'drafting';
-      try {
-        await this.#deliverDraft(a);
+      if (a.type === 'action') {
         a.status = 'drafted';
-      } catch (e) { a.status = 'failed'; a.error = e.message; await this.#note(a, `_Could not drop the draft:_ ${e.message}`); }
-      await this.#save(); await this.#audit(a.status, a, { via, error: a.error });
+        try {
+          await this.api.send(a.selfJid, { text: `*Proposal Details (#${a.id})*\n*Action:* ${a.title}\n*Target:* ${a.targetDesc}\n*Details:* ${a.details}\n_No action was executed._` });
+        } catch (e) { a.status = 'failed'; a.error = e.message; await this.#note(a, `_Could not deliver details:_ ${e.message}`); }
+        await this.#save(); await this.#audit(a.status, a, { via, error: a.error });
+      } else {
+        a.status = 'drafting';
+        try {
+          await this.#deliverDraft(a);
+          a.status = 'drafted';
+        } catch (e) { a.status = 'failed'; a.error = e.message; await this.#note(a, `_Could not drop the draft:_ ${e.message}`); }
+        await this.#save(); await this.#audit(a.status, a, { via, error: a.error });
+      }
     } else if (a.type === 'bulk') {
       if (this.bulkRun) return err('bulk_busy', 'Another broadcast is still sending.');
       this.#startBulk(a);
       await this.#audit('bulk_approved', a, { via, recipients: a.recips.length });
+    } else if (a.type === 'action') {
+      a.status = 'executing';
+      await this.#save();
+      try {
+        const sock = await withTimeout(this.api.conn.waitOpen(5000), 6000, 'connection');
+        const res = await this.#executeBaileysAction(sock, a);
+        if (!res || res.ok === false) throw new Error(res?.message || res?.error || 'Execution failed');
+        a.status = 'executed';
+        a.result = res;
+        await this.#note(a, `*Approved & executed:* ${a.title} (${a.targetDesc}).`);
+      } catch (e) {
+        a.status = 'failed';
+        a.error = e.message;
+        await this.#note(a, `_Execution failed for #${a.id}:_ ${e.message}`);
+      }
+      await this.#save();
+      await this.#audit(a.status, a, { via, error: a.error });
     } else {
       a.status = 'sending';
       await this.#save();
@@ -679,7 +1094,7 @@ export class Agent {
   async #expire(a) {
     a.status = 'expired'; a.decidedAt = this.now();
     await this.#save(); await this.#audit('expired', a);
-    await this.#note(a, `_Expired (#${a.id}). Nothing was sent._`);
+    await this.#note(a, a.type === 'action' ? `_Expired (#${a.id}). Nothing was changed._` : `_Expired (#${a.id}). Nothing was sent._`);
   }
 
   async sweep() {
@@ -768,8 +1183,11 @@ export class Agent {
   summary() {
     const p = this.#pending();
     const run = this.bulkRun && this.actions.get(this.bulkRun.id);
-    const live = run ? `*Sending #${run.id}:* ${counts(run).sent}/${run.recips.length} done. _Stop:_ *Lohra --agent stop*\\n` : '';
-    return [live + `Agent channel: ${this.paused ? 'PAUSED' : 'active'}`, p.length ? p.map((a) => `#${a.id} to ${a.to.name ?? a.to.display}: "${a.text.slice(0, 40)}${a.text.length > 40 ? '…' : ''}"`).join('\n') : 'Nothing waiting for you.'].join('\n');
+    const live = run ? `*Sending #${run.id}:* ${counts(run).sent}/${run.recips.length} done. _Stop:_ *Lohra --agent stop*\n` : '';
+    return [
+      live + `Agent channel: ${this.paused ? 'PAUSED' : 'active'}`,
+      p.length ? p.map((a) => `#${a.id} ${a.type === 'action' ? `[${a.title} for ${a.targetDesc}]: "${(a.details || '').slice(0, 40)}"` : `to ${a.to?.name ?? a.to?.display ?? 'Self'}: "${(a.text || '').slice(0, 40)}${(a.text || '').length > 40 ? '…' : ''}"`}`).join('\n') : 'Nothing waiting for you.'
+    ].join('\n');
   }
   pendingIds() { return this.#pending().map((a) => a.id); }
 }
